@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{.Title}}</title>
+  <base href="{{.BaseHref}}" />
+  <link rel="stylesheet" href="static/styles.css?v=20260801r7" />
+</head>
+<body class="login-page">
+  <div class="ambient-bg" aria-hidden="true"></div>
+  <main class="login-shell">
+    <section class="login-card">
+      <h1>ZIP Manga</h1>
+      <p>轻量私有漫画阅读服务</p>
+      <form id="loginForm" class="stack-form">
+        <label>
+          <span>用户名</span>
+          <input id="username" name="username" autocomplete="username" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" class="btn primary">登录</button>
+        <p id="loginError" class="error-line" hidden></p>
+      </form>
+    </section>
+  </main>
+  <script src="static/login.js?v=20260801r7" defer></script>
+</body>
+</html>

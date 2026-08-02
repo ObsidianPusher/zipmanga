@@ -1,0 +1,30 @@
+{
+  "server": {
+    "enable_http": true,
+    "http_addr": ":8080",
+    "enable_https": false,
+    "https_addr": ":8443",
+    "tls_cert": "",
+    "tls_key": "",
+    "session_ttl": "720h"
+  },
+  "database": {
+    "path": "./data/zipmanga.sqlite"
+  },
+  "cache": {
+    "dir": "./cache",
+    "cover_max_entries": 5000,
+    "thumb_width": 360,
+    "zip_temp_max_mb": 2048
+  },
+  "scan": {
+    "interval": "15m"
+  },
+  "runtime": {
+    "memory_limit_mb": 512
+  },
+  "bootstrap_admin": {
+    "username": "admin",
+    "password": "admin123"
+  }
+}

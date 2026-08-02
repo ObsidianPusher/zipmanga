@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{.Title}}</title>
+  <base href="{{.BaseHref}}" />
+  <link rel="stylesheet" href="static/styles.css?v=20260801r7" />
+</head>
+<body class="app-page" data-username="{{.Username}}" data-is-admin="{{.IsAdmin}}" data-view="{{.View}}" data-reader-comic-id="{{.ReaderComicID}}">
+  <div class="ambient-bg" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <strong>ZIP Manga</strong>
+      <span>轻量漫画阅读</span>
+    </div>
+    <nav class="nav-tabs">
+      <a href="./" class="tab-link" data-tab="library">书库</a>
+      <a href="favorites" class="tab-link" data-tab="favorites">收藏</a>
+      <a href="history" class="tab-link" data-tab="history">历史</a>
+      <a href="settings" class="tab-link" data-tab="settings">设置</a>
+    </nav>
+    <div class="toolbar">
+      <span id="userBadge" class="user-chip"></span>
+      <button id="logoutBtn" class="btn danger">退出</button>
+    </div>
+  </header>
+
+  <main class="page-wrap">
+    <section id="viewLibrary" class="view" hidden>
+      <section class="panel hero-card">
+        <div class="hero-title">
+          <h1>漫画书库</h1>
+          <p>按挂载统一检索，支持状态筛选、排序与进度恢复。</p>
+        </div>
+        <div class="hero-meta">
+          <span id="summaryText">加载中...</span>
+        </div>
+      </section>
+
+      <div class="glass tools-row">
+        <div class="field grow"><input id="searchInput" type="search" placeholder="搜索漫画标题..." /></div>
+        <div class="field"><select id="mountFilter"></select></div>
+        <div class="field"><select id="sortRule">
+            <option value="updated_desc">最近更新</option>
+            <option value="title_asc">名称 A-Z</option>
+            <option value="title_desc">名称 Z-A</option>
+            <option value="size_desc">体积大到小</option>
+            <option value="size_asc">体积小到大</option>
+          </select></div>
+        <div class="field"><select id="statusFilter">
+            <option value="all">全部</option>
+            <option value="unread">未读</option>
+            <option value="reading">阅读中</option>
+            <option value="finished">已读完</option>
+          </select></div>
+        <div class="field"><select id="formatFilter">
+            <option value="all">全部类型</option>
+            <option value="archive">压缩包（ZIP）</option>
+            <option value="zip">ZIP/CBZ</option>
+            <option value="pdf">PDF</option>
+          </select></div>
+        <div class="field"><button id="refreshBtn" class="btn">刷新</button></div>
+      </div>
+
+      <div class="library-pagination" aria-label="书库分页">
+        <div class="pager-main">
+          <button id="libraryPrevPageBtn" class="btn" type="button">上一页</button>
+          <span id="libraryPageText" class="page-text">第 1 / 1 页</span>
+          <button id="libraryNextPageBtn" class="btn" type="button">下一页</button>
+        </div>
+        <div class="pager-side">
+          <label class="pager-label" for="libraryPageSize">每页</label>
+          <select id="libraryPageSize">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="comicGrid" class="comic-grid"></div>
+    </section>
+
+    <section id="viewFavorites" class="view" hidden>
+      <section class="panel hero-card">
+        <div class="hero-title">
+          <h1>收藏漫画</h1>
+          <p>集中查看你标记的漫画，可直接继续阅读。</p>
+        </div>
+        <div class="hero-meta">
+          <span id="favoritesSummaryText">加载中...</span>
+        </div>
+      </section>
+
+      <div class="library-pagination" aria-label="收藏分页">
+        <div class="pager-main">
+          <button id="favoritesPrevPageBtn" class="btn" type="button">上一页</button>
+          <span id="favoritesPageText" class="page-text">第 1 / 1 页</span>
+          <button id="favoritesNextPageBtn" class="btn" type="button">下一页</button>
+        </div>
+        <div class="pager-side">
+          <label class="pager-label" for="favoritesPageSize">每页</label>
+          <select id="favoritesPageSize">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+          <button id="favoritesRefreshBtn" class="btn" type="button">刷新</button>
+        </div>
+      </div>
+
+      <div id="favoritesGrid" class="comic-grid"></div>
+    </section>
+
+    <section id="viewHistory" class="view" hidden>
+      <section class="panel hero-card">
+        <div class="hero-title">
+          <h1>观看历史</h1>
+          <p>继续上次阅读位置，快速回到最近打开的漫画。</p>
+        </div>
+      </section>
+      <div id="historyGrid" class="comic-grid"></div>
+    </section>
+
+    <section id="viewReader" class="view reader-view" hidden>
+      <div id="readerTopbar" class="reader-topbar panel">
+        <div class="reader-title-wrap">
+          <h1 id="readerTitle">阅读器</h1>
+          <p id="readerSubTitle"></p>
+        </div>
+        <div class="reader-toolbar">
+          <button id="readerFavoriteBtn" class="btn favorite-toggle" type="button">收藏</button>
+          <button id="readerFirstBtn" class="btn">第一页</button>
+          <button id="readerPrevBtn" class="btn">上一页</button>
+          <button id="readerNextBtn" class="btn">下一页</button>
+          <button id="readerLastBtn" class="btn">最后页</button>
+          <button id="readerFullscreenBtn" class="btn">全屏</button>
+          <button id="closeReaderBtn" class="btn">关闭阅读</button>
+        </div>
+        <div class="reader-progress-area">
+          <span id="readerProgressText"></span>
+          <input id="pageSlider" type="range" min="1" max="1" value="1" />
+        </div>
+      </div>
+
+      <div class="reader-shell">
+        <section id="readerStage" class="reader-stage" data-mode="paged" data-fit="width">
+          <div id="readerPagedWrap" class="reader-paged-wrap">
+            <div id="pagedSpread" class="paged-spread">
+              <div id="pagedSlotLeft" class="reader-page-slot">
+                <img id="pagedImageLeft" class="reader-page-media" alt="漫画页面" decoding="async" hidden />
+                <div class="reader-page-error" hidden aria-live="polite"></div>
+              </div>
+              <div id="pagedSlotRight" class="reader-page-slot" hidden>
+                <img id="pagedImageRight" class="reader-page-media" alt="漫画页面" decoding="async" hidden />
+                <div class="reader-page-error" hidden aria-live="polite"></div>
+              </div>
+            </div>
+          </div>
+          <div id="readerScrollWrap" class="reader-scroll-wrap" hidden>
+            <section id="readerPages" class="reader-pages"></section>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="viewSettings" class="view" hidden>
+      <section class="panel hero-card">
+        <div class="hero-title">
+          <h1>设置中心</h1>
+          <p>通过功能索引进入子模块，避免所有操作堆叠在同一页面。</p>
+        </div>
+      </section>
+
+      <div class="settings-hub">
+        <aside class="panel settings-index" aria-label="功能索引">
+          <h2>功能索引</h2>
+          <button class="settings-index-btn" type="button" data-settings-section="reader">阅读设置</button>
+          <button class="settings-index-btn" type="button" data-settings-section="security">账号安全</button>
+          <button class="settings-index-btn admin-only" type="button" data-settings-section="scan" hidden>扫描任务</button>
+          <button class="settings-index-btn admin-only" type="button" data-settings-section="archive-workflow" hidden>压缩包处理</button>
+          <button class="settings-index-btn admin-only" type="button" data-settings-section="runtime" hidden>运行时资源</button>
+          <button class="settings-index-btn admin-only" type="button" data-settings-section="roots" hidden>根目录库</button>
+          <button class="settings-index-btn admin-only" type="button" data-settings-section="mounts" hidden>挂载管理</button>
+          <button class="settings-index-btn admin-only" type="button" data-settings-section="users" hidden>账户管理</button>
+        </aside>
+
+        <div class="settings-content">
+          <section class="panel settings-module" data-settings-section="reader">
+            <h2>阅读默认设置</h2>
+            <form id="settingsForm" class="stack-form">
+              <label><span>默认阅读模式</span>
+                <select name="mode" id="settingsMode">
+                  <option value="paged">单页翻页</option>
+                  <option value="scroll">纵向滚动</option>
+                </select>
+              </label>
+              <label><span>默认显示适配</span>
+                <select name="fit" id="settingsFit">
+                  <option value="width">适配宽度</option>
+                  <option value="height">适配高度</option>
+                </select>
+              </label>
+              <label><span>图像优化策略（后端渲染，ZIP/PDF 分层处理）</span>
+                <select name="enhance" id="settingsEnhance">
+                  <option value="off">关闭</option>
+                  <option value="level1">1 级优化（推荐）</option>
+                  <option value="level2">2 级优化（黑白文字优先）</option>
+                </select>
+              </label>
+              <label><span>双页翻页方向</span>
+                <select name="spread_direction" id="settingsSpreadDirection">
+                  <option value="rtl">右开（日漫）</option>
+                  <option value="ltr">左开（美漫）</option>
+                </select>
+              </label>
+              <label class="check-line"><input id="settingsMobileCompact" type="checkbox" /><span>移动端紧凑控制台</span></label>
+              <button type="submit" class="btn primary">保存设置</button>
+            </form>
+          </section>
+
+          <section class="panel settings-module" data-settings-section="security" hidden>
+            <h2>修改密码</h2>
+            <form id="passwordForm" class="stack-form">
+              <label><span>当前密码</span><input type="password" id="currentPassword" required /></label>
+              <label><span>新密码</span><input type="password" id="newPassword" required /></label>
+              <label><span>确认新密码</span><input type="password" id="confirmPassword" required /></label>
+              <button type="submit" class="btn primary">修改密码</button>
+            </form>
+          </section>
+
+          <section class="panel settings-module admin-only" data-settings-section="scan" hidden>
+            <div class="row panel-head">
+              <h2>扫描与状态</h2>
+              <button id="scanBtn" class="btn primary">全量扫描</button>
+            </div>
+            <p class="hint">系统会按配置的定时周期检测挂载目录变化，仅在检测到新增、删除或文件变更时自动执行扫描。</p>
+            <div class="status-row"><span id="scanStatusText"></span></div>
+          </section>
+
+          <section class="panel settings-module admin-only" data-settings-section="archive-workflow" hidden>
+            <h2>压缩包后台任务（RAR/7Z 转 ZIP）</h2>
+            <form id="archiveWorkflowForm" class="stack-form compact">
+              <label>
+                <span>目标挂载（仅 local）</span>
+                <select id="archiveWorkflowMount"></select>
+              </label>
+              <label>
+                <span>解压密码（可选）</span>
+                <input id="archiveWorkflowPassword" type="password" placeholder="压缩包无密码可留空" />
+              </label>
+              <div class="archive-workflow-actions">
+                <button id="archiveCollectBtn" type="button" class="btn">1. 收集</button>
+                <button id="archiveExtractBtn" type="button" class="btn">2. 解压</button>
+                <button id="archiveOrganizeBtn" type="button" class="btn">3. 整理</button>
+                <button id="archiveRepackBtn" type="button" class="btn primary">4. 再压缩</button>
+              </div>
+              <p class="hint">点击按钮会创建后台任务。页面关闭后服务端继续执行；重新打开后可继续查看日志与结果。</p>
+
+              <div class="name-format-actions">
+                <button id="nameFormatPreviewBtn" type="button" class="btn">预览 UTF-8 命名格式化</button>
+                <button id="nameFormatApplyBtn" type="button" class="btn primary" disabled>确认执行格式化</button>
+              </div>
+              <p id="nameFormatPreviewSummary" class="hint">先点击“预览”，查看将被改名的文件/目录差异，再确认执行。</p>
+              <ul id="nameFormatDiffList" class="list slim"></ul>
+            </form>
+
+            <div class="archive-task-layout">
+              <div class="archive-task-list-wrap">
+                <div class="row panel-head">
+                  <h3>任务列表</h3>
+                  <button id="archiveTaskRefreshBtn" type="button" class="btn">刷新</button>
+                </div>
+                <ul id="archiveTaskList" class="list slim"></ul>
+              </div>
+              <div class="archive-task-console-wrap">
+                <h3>任务输出</h3>
+              <pre id="archiveWorkflowOutput" class="archive-workflow-output" aria-live="polite"></pre>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel settings-module admin-only" data-settings-section="runtime" hidden>
+            <h2>运行时资源控制</h2>
+            <form id="runtimeForm" class="stack-form compact">
+              <label>
+                <span>内存上限（MB）</span>
+                <input id="runtimeMemoryLimitMB" name="memory_limit_mb" type="number" min="256" max="32768" step="64" value="512" required />
+              </label>
+              <p class="hint">保存后立即生效，并持久化到数据库。建议内存上限默认保持 512MB。</p>
+              <button type="submit" class="btn primary">保存运行时设置</button>
+            </form>
+          </section>
+
+          <section class="panel settings-module admin-only" data-settings-section="roots" hidden>
+            <h2>根目录库</h2>
+            <form id="rootDirectoryForm" class="stack-form compact">
+              <label><span>显示名称</span><input name="name" placeholder="例如：主漫画盘" required /></label>
+              <label><span>根目录路径</span><input name="path" placeholder="/volume/manga" required /></label>
+              <button type="submit" class="btn primary">保存根目录</button>
+            </form>
+            <ul id="rootDirectoryList" class="list slim"></ul>
+          </section>
+
+          <section class="panel settings-module admin-only" data-settings-section="mounts" hidden>
+            <h2>挂载管理</h2>
+            <form id="mountForm" class="stack-form compact">
+              <label><span>名称</span><input name="name" required /></label>
+              <label><span>类型</span><select name="type" id="mountType"><option value="local">local</option><option value="smb">smb</option><option value="webdav">webdav</option></select></label>
+              <section class="mount-roots-block">
+                <div class="mount-roots-head">
+                  <span>挂载根路径（可多选）</span>
+                  <label><span>选择根目录库中的起点</span><select id="mountRootDirectorySelect"></select></label>
+                </div>
+                <div id="mountRootPathsEmpty" class="hint">尚未选择挂载路径。请从已配置根目录加载目录树后添加。</div>
+                <div id="mountRootPaths" class="mount-root-chip-list"></div>
+              </section>
+
+              <div class="group smb-only" hidden>
+                <label><span>SMB Host</span><input name="smb_host" /></label>
+                <label><span>SMB Port</span><input name="smb_port" type="number" value="445" /></label>
+                <label><span>SMB Share</span><input name="smb_share" /></label>
+                <label><span>SMB User</span><input name="smb_user" /></label>
+                <label><span>SMB Password</span><input name="smb_password" type="password" /></label>
+                <label><span>SMB Domain</span><input name="smb_domain" /></label>
+              </div>
+              <div class="group webdav-only" hidden>
+                <label><span>WebDAV URL</span><input name="webdav_url" placeholder="https://host/remote.php/dav/files/user" /></label>
+                <label><span>WebDAV User</span><input name="webdav_user" /></label>
+                <label><span>WebDAV Password</span><input name="webdav_password" type="password" /></label>
+              </div>
+
+              <section class="mount-browser panel">
+                <div class="mount-browser-head">
+                  <label><span>当前浏览子路径（相对选中根目录）</span><input id="mountBrowsePathInput" type="text" value="/" placeholder="/" /></label>
+                  <button id="mountBrowseRootBtn" type="button" class="btn">从已选根目录加载目录树</button>
+                </div>
+                <div class="hint">目录树起点来自“根目录库”。点击目录右侧“添加”即可加入本挂载的根路径列表。</div>
+                <div id="mountTreeRoot" class="mount-tree-wrap" role="tree" aria-label="根路径目录树"></div>
+              </section>
+
+              <label class="check-line"><input name="enabled" type="checkbox" checked /><span>启用</span></label>
+              <button type="submit" class="btn primary">新增挂载</button>
+            </form>
+            <ul id="mountList" class="list slim"></ul>
+          </section>
+
+          <section class="panel settings-module admin-only" data-settings-section="users" hidden>
+            <h2>账户管理</h2>
+            <form id="userForm" class="stack-form compact">
+              <label><span>用户名</span><input name="username" required /></label>
+              <label><span>密码</span><input name="password" type="password" required /></label>
+              <label class="check-line"><input name="is_admin" type="checkbox" /><span>管理员</span></label>
+              <button type="submit" class="btn primary">创建用户</button>
+            </form>
+            <ul id="userList" class="list slim"></ul>
+          </section>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="static/vendor/pdfjs/pdf.min.js?v=20260801r7" defer></script>
+  <script src="static/app.js?v=20260801r7" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+/bin/
+/.cache/
+/dist/
+/data/
+/cache/
+config.json
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
