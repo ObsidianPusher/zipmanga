@@ -1,9 +1,12 @@
 package db
 
 import (
+	"archive/zip"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -202,6 +205,145 @@ func TestCleanupOldHistoryKeepsLatestHundred(t *testing.T) {
 	}
 }
 
+func TestUpsertReadingProgressHandlesConcurrentRequests(t *testing.T) {
+	store := openTestStore(t)
+
+	user, err := store.CreateUser("concurrent-user", "hash", false)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	mount, err := store.CreateMount(Mount{
+		Name:     "concurrent-mount",
+		Type:     MountTypeLocal,
+		RootPath: "/concurrent",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateMount failed: %v", err)
+	}
+	if err := store.ReplaceComicsForMount(mount.ID, []Comic{
+		{
+			MountID:     mount.ID,
+			Path:        "series/Concurrent.zip",
+			Title:       "Concurrent",
+			FileNameKey: "concurrent.zip",
+			MtimeUnix:   100,
+			Size:        1024,
+			PageCount:   20,
+			CoverKey:    "cv6:cover:file:concurrent.zip",
+		},
+	}); err != nil {
+		t.Fatalf("ReplaceComicsForMount failed: %v", err)
+	}
+	comics, err := store.ListComicsByMount(mount.ID)
+	if err != nil {
+		t.Fatalf("ListComicsByMount failed: %v", err)
+	}
+	if len(comics) != 1 {
+		t.Fatalf("comics len=%d want=1", len(comics))
+	}
+	comic := comics[0]
+
+	const workers = 16
+	start := make(chan struct{})
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		page := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, callErr := store.UpsertReadingProgress(user.ID, comic.ID, comic.FileNameKey, page, comic.PageCount)
+			errCh <- callErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for callErr := range errCh {
+		if callErr != nil {
+			t.Fatalf("concurrent UpsertReadingProgress failed: %v", callErr)
+		}
+	}
+
+	var count int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM reading_progress WHERE user_id = ? AND comic_file_name_key = ?`, user.ID, comic.FileNameKey).Scan(&count); err != nil {
+		t.Fatalf("count reading_progress failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("reading_progress count=%d want=1", count)
+	}
+}
+
+func TestWebPArchiveManifestRoundTrip(t *testing.T) {
+	store := openTestStore(t)
+
+	baseDir := t.TempDir()
+	sourcePath := filepath.Join(baseDir, "input.cbz")
+	outputPath := filepath.Join(baseDir, "output.zip")
+	if err := os.WriteFile(sourcePath, []byte("source"), 0o644); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+	out, err := os.Create(outputPath)
+	if err != nil {
+		t.Fatalf("create output failed: %v", err)
+	}
+	zipWriter := zip.NewWriter(out)
+	entry, err := zipWriter.Create("page.webp")
+	if err != nil {
+		t.Fatalf("create zip entry failed: %v", err)
+	}
+	if _, err := entry.Write([]byte("webp")); err != nil {
+		t.Fatalf("write zip entry failed: %v", err)
+	}
+	if err := zipWriter.Close(); err != nil {
+		t.Fatalf("close zip writer failed: %v", err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatalf("close output failed: %v", err)
+	}
+
+	completedAt := time.Now().UTC().Round(0)
+	want := WebPArchiveManifest{
+		SourcePath:       sourcePath,
+		OutputZipPath:    outputPath,
+		Quality:          75,
+		Method:           4,
+		SourceMtimeUnix:  123456789,
+		SourceSize:       1024,
+		SourceEntryCount: 12,
+		ConvertedEntries: 10,
+		KeptEntries:      2,
+		OutputSize:       2048,
+		CompletedAt:      completedAt,
+	}
+	if err := store.UpsertWebPArchiveManifest(want); err != nil {
+		t.Fatalf("UpsertWebPArchiveManifest failed: %v", err)
+	}
+
+	got, err := store.GetWebPArchiveManifest(sourcePath, outputPath, 75, 4)
+	if err != nil {
+		t.Fatalf("GetWebPArchiveManifest failed: %v", err)
+	}
+	if got.SourcePath != want.SourcePath || got.OutputZipPath != want.OutputZipPath {
+		t.Fatalf("manifest path mismatch: got=%+v want=%+v", got, want)
+	}
+	if got.ConvertedEntries != want.ConvertedEntries || got.KeptEntries != want.KeptEntries {
+		t.Fatalf("manifest counts mismatch: got=%+v want=%+v", got, want)
+	}
+	if got.SourceEntryCount != want.SourceEntryCount || got.OutputSize != want.OutputSize {
+		t.Fatalf("manifest sizes mismatch: got=%+v want=%+v", got, want)
+	}
+	if !got.CompletedAt.Equal(completedAt) {
+		t.Fatalf("completed_at=%v want=%v", got.CompletedAt, completedAt)
+	}
+	if got.UpdatedAt.IsZero() {
+		t.Fatal("updated_at should be populated")
+	}
+}
+
 func TestLibraryDedupesByFileNameAndPrefersLargerFile(t *testing.T) {
 	store := openTestStore(t)
 
@@ -322,6 +464,10 @@ func TestOpenRepairsMissingColumnsAtStartup(t *testing.T) {
 		`CREATE TABLE app_runtime_settings (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			memory_limit_mb INTEGER NOT NULL,
+			disk_cache_mb INTEGER NOT NULL,
+			page_prefetch_pages INTEGER NOT NULL,
+			frontend_page_prefetch_pages INTEGER NOT NULL,
+			page_load_parallelism INTEGER NOT NULL,
 			gc_percent INTEGER NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
@@ -357,6 +503,10 @@ func TestOpenRepairsMissingColumnsAtStartup(t *testing.T) {
 		{table: "favorite_comics", column: "comic_file_name_key"},
 		{table: "cache_entries", column: "last_access"},
 		{table: "cache_entries", column: "created_at"},
+		{table: "app_runtime_settings", column: "disk_cache_mb"},
+		{table: "app_runtime_settings", column: "page_prefetch_pages"},
+		{table: "app_runtime_settings", column: "frontend_page_prefetch_pages"},
+		{table: "app_runtime_settings", column: "page_load_parallelism"},
 		{table: "app_runtime_settings", column: "updated_at"},
 	}
 	for _, check := range columnChecks {
@@ -367,6 +517,135 @@ func TestOpenRepairsMissingColumnsAtStartup(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected repaired column %s.%s to exist", check.table, check.column)
 		}
+	}
+}
+
+func TestOpenRepairsLegacyFileNameIndexesToUnique(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "legacy-indexes.sqlite")
+
+	rawDB, err := sql.Open("sqlite", fmt.Sprintf("file:%s", dbPath))
+	if err != nil {
+		t.Fatalf("sql.Open failed: %v", err)
+	}
+	legacyStmts := []string{
+		`CREATE TABLE users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			username TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			is_admin INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE comics (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			mount_id INTEGER NOT NULL,
+			path TEXT NOT NULL,
+			title TEXT NOT NULL,
+			file_name_key TEXT NOT NULL DEFAULT '',
+			mtime_unix INTEGER NOT NULL,
+			size INTEGER NOT NULL,
+			page_count INTEGER NOT NULL,
+			cover_key TEXT,
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE reading_progress (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			comic_id INTEGER,
+			comic_file_name_key TEXT NOT NULL DEFAULT '',
+			last_page INTEGER NOT NULL DEFAULT 0,
+			total_pages INTEGER NOT NULL DEFAULT 0,
+			last_read_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(user_id, comic_id)
+		)`,
+		`CREATE INDEX idx_reading_progress_user_file_name ON reading_progress(user_id, comic_file_name_key)`,
+		`CREATE TABLE favorite_comics (
+			user_id INTEGER NOT NULL,
+			comic_id INTEGER NOT NULL,
+			comic_file_name_key TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			PRIMARY KEY (user_id, comic_id)
+		)`,
+		`CREATE INDEX idx_favorite_comics_user_file_name ON favorite_comics(user_id, comic_file_name_key)`,
+		`CREATE TABLE cache_entries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			key TEXT NOT NULL UNIQUE,
+			rel_path TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			last_access INTEGER NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE app_runtime_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			memory_limit_mb INTEGER NOT NULL,
+			disk_cache_mb INTEGER NOT NULL,
+			page_prefetch_pages INTEGER NOT NULL,
+			frontend_page_prefetch_pages INTEGER NOT NULL,
+			page_load_parallelism INTEGER NOT NULL,
+			gc_percent INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
+	}
+	for _, stmt := range legacyStmts {
+		if _, err := rawDB.Exec(stmt); err != nil {
+			_ = rawDB.Close()
+			t.Fatalf("create legacy schema failed for %q: %v", stmt, err)
+		}
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw db failed: %v", err)
+	}
+
+	store, err := Open(dbPath, nil)
+	if err != nil {
+		t.Fatalf("Open should repair legacy indexes, got err=%v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+
+	assertUnique := func(tableName, indexName string) {
+		t.Helper()
+		found, unique, _, err := store.indexDetails(tableName, indexName)
+		if err != nil {
+			t.Fatalf("indexDetails(%s, %s) failed: %v", tableName, indexName, err)
+		}
+		if !found {
+			t.Fatalf("expected index %s on %s to exist", indexName, tableName)
+		}
+		if !unique {
+			t.Fatalf("expected index %s on %s to be unique", indexName, tableName)
+		}
+	}
+
+	assertUnique("reading_progress", "idx_reading_progress_user_file_name")
+	assertUnique("favorite_comics", "idx_favorite_comics_user_file_name")
+}
+
+func TestGetReadingProgressForComicFallsBackToFileNameKey(t *testing.T) {
+	store := openTestStore(t)
+
+	user, err := store.CreateUser("fallback-user", "hash", false)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+
+	progress, err := store.UpsertReadingProgress(user.ID, 0, "fallback-series.zip", 7, 20)
+	if err != nil {
+		t.Fatalf("UpsertReadingProgress failed: %v", err)
+	}
+
+	got, err := store.GetReadingProgressForComic(user.ID, 999999, "fallback-series.zip")
+	if err != nil {
+		t.Fatalf("GetReadingProgressForComic fallback failed: %v", err)
+	}
+	if got.ID != progress.ID {
+		t.Fatalf("progress id=%d want=%d", got.ID, progress.ID)
+	}
+	if got.LastPage != 7 {
+		t.Fatalf("last_page=%d want=7", got.LastPage)
 	}
 }
 

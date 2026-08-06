@@ -178,10 +178,75 @@ func (s *Store) Migrate() error {
 		`CREATE TABLE IF NOT EXISTS app_runtime_settings (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			memory_limit_mb INTEGER NOT NULL,
+			disk_cache_mb INTEGER NOT NULL,
+			page_prefetch_pages INTEGER NOT NULL,
+			frontend_page_prefetch_pages INTEGER NOT NULL,
+			page_load_parallelism INTEGER NOT NULL,
+			webp_quality INTEGER NOT NULL DEFAULT 75,
+			webp_method INTEGER NOT NULL DEFAULT 0,
+			webp_concurrency INTEGER NOT NULL DEFAULT 2,
+			webp_output_root TEXT NOT NULL DEFAULT '',
 			gc_percent INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS webp_tasks (
+			id TEXT PRIMARY KEY,
+			source_root_path TEXT NOT NULL,
+			source_path TEXT NOT NULL,
+			output_root_path TEXT NOT NULL,
+			output_dir_path TEXT NOT NULL,
+			quality INTEGER NOT NULL,
+			method INTEGER NOT NULL,
+			concurrency INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			total_archives INTEGER NOT NULL DEFAULT 0,
+			done_archives INTEGER NOT NULL DEFAULT 0,
+			partial_archives INTEGER NOT NULL DEFAULT 0,
+			pending_archives INTEGER NOT NULL DEFAULT 0,
+			current_archive TEXT NOT NULL DEFAULT '',
+			current_archive_done INTEGER NOT NULL DEFAULT 0,
+			current_archive_total INTEGER NOT NULL DEFAULT 0,
+			current_phase TEXT NOT NULL DEFAULT '',
+			current_item TEXT NOT NULL DEFAULT '',
+			cancel_requested INTEGER NOT NULL DEFAULT 0,
+			last_seq INTEGER NOT NULL DEFAULT 0,
+			summary_json TEXT NOT NULL DEFAULT '{}',
+			error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			started_at TEXT NOT NULL DEFAULT '',
+			finished_at TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS webp_task_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			task_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			level TEXT NOT NULL,
+			message TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(task_id) REFERENCES webp_tasks(id) ON DELETE CASCADE,
+			UNIQUE(task_id, seq)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_webp_tasks_status_created ON webp_tasks(status, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_webp_task_logs_task_seq ON webp_task_logs(task_id, seq ASC)`,
+		`CREATE TABLE IF NOT EXISTS webp_archive_manifests (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_path TEXT NOT NULL,
+			output_zip_path TEXT NOT NULL,
+			quality INTEGER NOT NULL,
+			method INTEGER NOT NULL,
+			source_mtime_unix INTEGER NOT NULL,
+			source_size INTEGER NOT NULL,
+			source_entry_count INTEGER NOT NULL,
+			converted_entries INTEGER NOT NULL,
+			kept_entries INTEGER NOT NULL,
+			output_size INTEGER NOT NULL,
+			completed_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			UNIQUE(source_path, output_zip_path, quality, method)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_webp_archive_manifests_source_output ON webp_archive_manifests(source_path, output_zip_path)`,
 	}
 
 	for _, stmt := range stmts {
@@ -241,6 +306,42 @@ func (s *Store) ValidateAndRepairSchema() error {
 	if err := s.ensureColumn("app_runtime_settings", "updated_at", `ALTER TABLE app_runtime_settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("app_runtime_settings", "disk_cache_mb", `ALTER TABLE app_runtime_settings ADD COLUMN disk_cache_mb INTEGER NOT NULL DEFAULT 10240`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "page_prefetch_pages", `ALTER TABLE app_runtime_settings ADD COLUMN page_prefetch_pages INTEGER NOT NULL DEFAULT 10`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "frontend_page_prefetch_pages", `ALTER TABLE app_runtime_settings ADD COLUMN frontend_page_prefetch_pages INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "page_load_parallelism", `ALTER TABLE app_runtime_settings ADD COLUMN page_load_parallelism INTEGER NOT NULL DEFAULT 4`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "webp_quality", `ALTER TABLE app_runtime_settings ADD COLUMN webp_quality INTEGER NOT NULL DEFAULT 75`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "webp_method", `ALTER TABLE app_runtime_settings ADD COLUMN webp_method INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "webp_concurrency", `ALTER TABLE app_runtime_settings ADD COLUMN webp_concurrency INTEGER NOT NULL DEFAULT 2`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("app_runtime_settings", "webp_output_root", `ALTER TABLE app_runtime_settings ADD COLUMN webp_output_root TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("webp_tasks", "partial_archives", `ALTER TABLE webp_tasks ADD COLUMN partial_archives INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("webp_tasks", "pending_archives", `ALTER TABLE webp_tasks ADD COLUMN pending_archives INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("webp_tasks", "current_archive_done", `ALTER TABLE webp_tasks ADD COLUMN current_archive_done INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("webp_tasks", "current_archive_total", `ALTER TABLE webp_tasks ADD COLUMN current_archive_total INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	if err := s.backfillComicFileNameKeys(); err != nil {
 		return err
 	}
@@ -265,10 +366,10 @@ func (s *Store) ValidateAndRepairSchema() error {
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cache_last_access ON cache_entries(last_access)`); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_progress_user_file_name ON reading_progress(user_id, comic_file_name_key)`); err != nil {
+	if err := s.ensureUniqueIndex("reading_progress", "idx_reading_progress_user_file_name", []string{"user_id", "comic_file_name_key"}, `CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_progress_user_file_name ON reading_progress(user_id, comic_file_name_key)`); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_favorite_comics_user_file_name ON favorite_comics(user_id, comic_file_name_key)`); err != nil {
+	if err := s.ensureUniqueIndex("favorite_comics", "idx_favorite_comics_user_file_name", []string{"user_id", "comic_file_name_key"}, `CREATE UNIQUE INDEX IF NOT EXISTS idx_favorite_comics_user_file_name ON favorite_comics(user_id, comic_file_name_key)`); err != nil {
 		return err
 	}
 	if err := s.ensureSchemaVersion(currentSchemaVersion); err != nil {
@@ -358,10 +459,10 @@ func (s *Store) migrateFilenameKeys() error {
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cache_last_access ON cache_entries(last_access)`); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_progress_user_file_name ON reading_progress(user_id, comic_file_name_key)`); err != nil {
+	if err := s.ensureUniqueIndex("reading_progress", "idx_reading_progress_user_file_name", []string{"user_id", "comic_file_name_key"}, `CREATE UNIQUE INDEX IF NOT EXISTS idx_reading_progress_user_file_name ON reading_progress(user_id, comic_file_name_key)`); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_favorite_comics_user_file_name ON favorite_comics(user_id, comic_file_name_key)`); err != nil {
+	if err := s.ensureUniqueIndex("favorite_comics", "idx_favorite_comics_user_file_name", []string{"user_id", "comic_file_name_key"}, `CREATE UNIQUE INDEX IF NOT EXISTS idx_favorite_comics_user_file_name ON favorite_comics(user_id, comic_file_name_key)`); err != nil {
 		return err
 	}
 	if err := s.backfillComicFileNameKeys(); err != nil {
@@ -598,6 +699,124 @@ func (s *Store) columnExists(tableName, columnName string) (bool, error) {
 	default:
 		return false, err
 	}
+}
+
+func (s *Store) ensureUniqueIndex(tableName, indexName string, columns []string, createStmt string) error {
+	tableName = strings.TrimSpace(tableName)
+	indexName = strings.TrimSpace(indexName)
+	if tableName == "" || indexName == "" {
+		return errors.New("table and index names are required")
+	}
+	if len(columns) == 0 {
+		return errors.New("index columns are required")
+	}
+
+	found, unique, existingColumns, err := s.indexDetails(tableName, indexName)
+	if err != nil {
+		return err
+	}
+	if found && unique && sameIndexColumns(existingColumns, columns) {
+		return nil
+	}
+	if found {
+		if _, err := s.db.Exec(fmt.Sprintf(`DROP INDEX IF EXISTS %s`, quoteSQLiteIdentifier(indexName))); err != nil {
+			return fmt.Errorf("drop index %s: %w", indexName, err)
+		}
+	}
+	if _, err := s.db.Exec(createStmt); err != nil {
+		return fmt.Errorf("create unique index %s: %w", indexName, err)
+	}
+	return nil
+}
+
+func (s *Store) indexDetails(tableName, indexName string) (bool, bool, []string, error) {
+	tableName = strings.TrimSpace(tableName)
+	indexName = strings.TrimSpace(indexName)
+	if tableName == "" || indexName == "" {
+		return false, false, nil, errors.New("table and index names are required")
+	}
+
+	tableName = strings.ReplaceAll(tableName, "'", "''")
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA index_list('%s')`, tableName))
+	if err != nil {
+		return false, false, nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			seq     int
+			name    string
+			unique  int
+			origin  string
+			partial int
+		)
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			return false, false, nil, err
+		}
+		if name != indexName {
+			continue
+		}
+		columns, err := s.indexColumns(indexName)
+		if err != nil {
+			return false, false, nil, err
+		}
+		return true, unique == 1, columns, nil
+	}
+	if err := rows.Err(); err != nil {
+		return false, false, nil, err
+	}
+	return false, false, nil, nil
+}
+
+func (s *Store) indexColumns(indexName string) ([]string, error) {
+	indexName = strings.TrimSpace(indexName)
+	if indexName == "" {
+		return nil, errors.New("index name is required")
+	}
+
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA index_info(%s)`, quoteSQLiteString(indexName)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := make([]string, 0, 4)
+	for rows.Next() {
+		var (
+			seqno int
+			cid   int
+			name  string
+		)
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return nil, err
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
+}
+
+func sameIndexColumns(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func quoteSQLiteIdentifier(v string) string {
+	return `"` + strings.ReplaceAll(v, `"`, `""`) + `"`
+}
+
+func quoteSQLiteString(v string) string {
+	return `'` + strings.ReplaceAll(v, `'`, `''`) + `'`
 }
 
 func (s *Store) backfillComicFileNameKeys() error {
@@ -838,7 +1057,7 @@ func (s *Store) UpsertReaderSettings(v ReaderSettings) error {
 
 func (s *Store) GetRuntimeSettings() (RuntimeSettings, error) {
 	row := s.db.QueryRow(`
-		SELECT id, memory_limit_mb, created_at, updated_at
+		SELECT id, memory_limit_mb, disk_cache_mb, page_prefetch_pages, frontend_page_prefetch_pages, page_load_parallelism, webp_quality, webp_method, webp_concurrency, webp_output_root, created_at, updated_at
 		FROM app_runtime_settings
 		WHERE id = 1
 	`)
@@ -852,13 +1071,21 @@ func (s *Store) UpsertRuntimeSettings(v RuntimeSettings) error {
 		createdAt = v.CreatedAt.UTC().Format(time.RFC3339Nano)
 	}
 	_, err := s.db.Exec(`
-		INSERT INTO app_runtime_settings (id, memory_limit_mb, gc_percent, created_at, updated_at)
-		VALUES (1, ?, ?, ?, ?)
+		INSERT INTO app_runtime_settings (id, memory_limit_mb, disk_cache_mb, page_prefetch_pages, frontend_page_prefetch_pages, page_load_parallelism, webp_quality, webp_method, webp_concurrency, webp_output_root, gc_percent, created_at, updated_at)
+		VALUES (1, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			memory_limit_mb=excluded.memory_limit_mb,
+			disk_cache_mb=excluded.disk_cache_mb,
+			page_prefetch_pages=excluded.page_prefetch_pages,
+			frontend_page_prefetch_pages=excluded.frontend_page_prefetch_pages,
+			page_load_parallelism=excluded.page_load_parallelism,
+			webp_quality=excluded.webp_quality,
+			webp_method=excluded.webp_method,
+			webp_concurrency=excluded.webp_concurrency,
+			webp_output_root=excluded.webp_output_root,
 			gc_percent=excluded.gc_percent,
 			updated_at=excluded.updated_at
-	`, v.MemoryLimitMB, legacyRuntimeGCPercent, createdAt, now)
+	`, v.MemoryLimitMB, v.DiskCacheMB, v.PagePrefetchPages, v.PageLoadParallelism, v.WebPQuality, v.WebPMethod, v.WebPConcurrency, strings.TrimSpace(v.WebPOutputRoot), legacyRuntimeGCPercent, createdAt, now)
 	return err
 }
 
@@ -1129,6 +1356,51 @@ func (s *Store) DeleteRootDirectory(id int64) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+func (s *Store) GetWebPArchiveManifest(sourcePath, outputZipPath string, quality, method int64) (WebPArchiveManifest, error) {
+	row := s.db.QueryRow(`
+		SELECT
+			id, source_path, output_zip_path, quality, method,
+			source_mtime_unix, source_size, source_entry_count,
+			converted_entries, kept_entries, output_size,
+			completed_at, updated_at
+		FROM webp_archive_manifests
+		WHERE source_path = ? AND output_zip_path = ? AND quality = ? AND method = ?
+	`, strings.TrimSpace(sourcePath), strings.TrimSpace(outputZipPath), quality, method)
+	return scanWebPArchiveManifest(row)
+}
+
+func (s *Store) UpsertWebPArchiveManifest(v WebPArchiveManifest) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	completedAt := now
+	if !v.CompletedAt.IsZero() {
+		completedAt = v.CompletedAt.UTC().Format(time.RFC3339Nano)
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO webp_archive_manifests (
+			source_path, output_zip_path, quality, method,
+			source_mtime_unix, source_size, source_entry_count,
+			converted_entries, kept_entries, output_size,
+			completed_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(source_path, output_zip_path, quality, method) DO UPDATE SET
+			source_mtime_unix=excluded.source_mtime_unix,
+			source_size=excluded.source_size,
+			source_entry_count=excluded.source_entry_count,
+			converted_entries=excluded.converted_entries,
+			kept_entries=excluded.kept_entries,
+			output_size=excluded.output_size,
+			completed_at=excluded.completed_at,
+			updated_at=excluded.updated_at
+	`,
+		strings.TrimSpace(v.SourcePath), strings.TrimSpace(v.OutputZipPath), v.Quality, v.Method,
+		v.SourceMtimeUnix, v.SourceSize, v.SourceEntryCount,
+		v.ConvertedEntries, v.KeptEntries, v.OutputSize,
+		completedAt, now,
+	)
+	return err
 }
 
 func (s *Store) ReplaceComicsForMount(mountID int64, comics []Comic) error {
@@ -1610,34 +1882,24 @@ func (s *Store) UpsertReadingProgress(userID, comicID int64, fileNameKey string,
 		_ = tx.Rollback()
 	}()
 
-	var existingID int64
-	row := tx.QueryRow(`SELECT id FROM reading_progress WHERE user_id = ? AND comic_file_name_key = ? LIMIT 1`, userID, fileNameKey)
-	if scanErr := row.Scan(&existingID); scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return ReadingProgress{}, scanErr
-	}
-
 	nowRaw := now.Format(time.RFC3339Nano)
-	if existingID > 0 {
-		_, err = tx.Exec(`
-			UPDATE reading_progress
-			SET comic_id = ?, last_page = ?, total_pages = ?, last_read_at = ?, updated_at = ?
-			WHERE id = ?
-		`, comicID, lastPage, totalPages, nowRaw, nowRaw, existingID)
-	} else {
-		_, err = tx.Exec(`
-			INSERT INTO reading_progress (user_id, comic_id, comic_file_name_key, last_page, total_pages, last_read_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-		`, userID, comicID, fileNameKey, lastPage, totalPages, nowRaw, nowRaw)
-	}
+	_, err = tx.Exec(`
+		INSERT INTO reading_progress (user_id, comic_id, comic_file_name_key, last_page, total_pages, last_read_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(user_id, comic_file_name_key) DO UPDATE SET
+			comic_id = excluded.comic_id,
+			last_page = excluded.last_page,
+			total_pages = excluded.total_pages,
+			last_read_at = excluded.last_read_at,
+			updated_at = excluded.updated_at
+	`, userID, comicID, fileNameKey, lastPage, totalPages, nowRaw, nowRaw)
 	if err != nil {
 		return ReadingProgress{}, err
 	}
 	if err = tx.Commit(); err != nil {
 		return ReadingProgress{}, err
 	}
-	if err := s.CleanupOldHistory(userID, 100); err != nil {
-		return ReadingProgress{}, err
-	}
+	_ = s.CleanupOldHistory(userID, 100)
 	return s.GetReadingProgressByFileName(userID, fileNameKey)
 }
 
@@ -1718,6 +1980,10 @@ func (s *Store) IsComicFavorite(userID, comicID int64) (bool, error) {
 }
 
 func (s *Store) GetReadingProgress(userID, comicID int64) (ReadingProgress, error) {
+	return s.GetReadingProgressForComic(userID, comicID, "")
+}
+
+func (s *Store) GetReadingProgressForComic(userID, comicID int64, fileNameKey string) (ReadingProgress, error) {
 	row := s.db.QueryRow(`
 		SELECT id, user_id, comic_id, comic_file_name_key, last_page, total_pages, last_read_at, updated_at
 		FROM reading_progress
@@ -1730,9 +1996,16 @@ func (s *Store) GetReadingProgress(userID, comicID int64) (ReadingProgress, erro
 	if !errors.Is(err, sql.ErrNoRows) {
 		return ReadingProgress{}, err
 	}
-	fileNameKey, keyErr := s.resolveComicFileNameKey(comicID)
-	if keyErr != nil {
-		return ReadingProgress{}, keyErr
+	fileNameKey = normalizeFileNameKey(fileNameKey)
+	if fileNameKey == "" && comicID > 0 {
+		key, keyErr := s.resolveComicFileNameKey(comicID)
+		if keyErr != nil {
+			if errors.Is(keyErr, sql.ErrNoRows) {
+				return ReadingProgress{}, sql.ErrNoRows
+			}
+			return ReadingProgress{}, keyErr
+		}
+		fileNameKey = key
 	}
 	if fileNameKey == "" {
 		return ReadingProgress{}, sql.ErrNoRows
@@ -1929,9 +2202,33 @@ func (s *Store) TotalCacheEntries() (int64, error) {
 	return total.Int64, nil
 }
 
+func (s *Store) TotalCacheEntriesByRelPathPrefix(prefix string) (int64, error) {
+	var total sql.NullInt64
+	err := s.db.QueryRow(`SELECT COUNT(1) FROM cache_entries WHERE rel_path LIKE ?`, cacheRelPathPrefixLike(prefix)).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return total.Int64, nil
+}
+
 func (s *Store) TotalCacheSize() (int64, error) {
 	var total sql.NullInt64
 	err := s.db.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM cache_entries`).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return total.Int64, nil
+}
+
+func (s *Store) TotalCacheSizeWithPrefix(prefix string) (int64, error) {
+	var total sql.NullInt64
+	err := s.db.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM cache_entries WHERE key LIKE ?`, cacheKeyPrefixLike(prefix)).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -1948,9 +2245,69 @@ func (s *Store) ListOldestCacheEntries(limit int) ([]CacheEntry, error) {
 	rows, err := s.db.Query(`
 		SELECT id, key, rel_path, size, last_access, created_at
 		FROM cache_entries
-		ORDER BY created_at ASC, id ASC
+		ORDER BY last_access ASC, created_at ASC, id ASC
 		LIMIT ?
 	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]CacheEntry, 0)
+	for rows.Next() {
+		e, err := scanCacheEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListOldestCacheEntriesWithPrefix(prefix string, limit int) ([]CacheEntry, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	rows, err := s.db.Query(`
+		SELECT id, key, rel_path, size, last_access, created_at
+		FROM cache_entries
+		WHERE key LIKE ?
+		ORDER BY last_access ASC, created_at ASC, id ASC
+		LIMIT ?
+	`, cacheKeyPrefixLike(prefix), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]CacheEntry, 0)
+	for rows.Next() {
+		e, err := scanCacheEntry(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListOldestCacheEntriesByRelPathPrefix(prefix string, limit int) ([]CacheEntry, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	rows, err := s.db.Query(`
+		SELECT id, key, rel_path, size, last_access, created_at
+		FROM cache_entries
+		WHERE rel_path LIKE ?
+		ORDER BY last_access ASC, created_at ASC, id ASC
+		LIMIT ?
+	`, cacheRelPathPrefixLike(prefix), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1973,6 +2330,21 @@ func (s *Store) ListOldestCacheEntries(limit int) ([]CacheEntry, error) {
 func (s *Store) DeleteCacheEntryByID(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM cache_entries WHERE id = ?`, id)
 	return err
+}
+
+func cacheKeyPrefixLike(prefix string) string {
+	if prefix == "" {
+		return "%"
+	}
+	return prefix + "%"
+}
+
+func cacheRelPathPrefixLike(prefix string) string {
+	prefix = filepath.ToSlash(strings.TrimSpace(prefix))
+	if prefix == "" {
+		return "%"
+	}
+	return prefix + "%"
 }
 
 func scanUser(scanner interface{ Scan(dest ...any) error }) (User, error) {
@@ -2133,6 +2505,29 @@ func scanRootDirectory(scanner interface{ Scan(dest ...any) error }) (RootDirect
 	return item, nil
 }
 
+func scanWebPArchiveManifest(scanner interface{ Scan(dest ...any) error }) (WebPArchiveManifest, error) {
+	var item WebPArchiveManifest
+	var completedRaw, updatedRaw string
+	if err := scanner.Scan(
+		&item.ID, &item.SourcePath, &item.OutputZipPath, &item.Quality, &item.Method,
+		&item.SourceMtimeUnix, &item.SourceSize, &item.SourceEntryCount,
+		&item.ConvertedEntries, &item.KeptEntries, &item.OutputSize,
+		&completedRaw, &updatedRaw,
+	); err != nil {
+		return WebPArchiveManifest{}, err
+	}
+	var err error
+	item.CompletedAt, err = time.Parse(time.RFC3339Nano, completedRaw)
+	if err != nil {
+		return WebPArchiveManifest{}, err
+	}
+	item.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedRaw)
+	if err != nil {
+		return WebPArchiveManifest{}, err
+	}
+	return item, nil
+}
+
 func scanReadingProgress(scanner interface{ Scan(dest ...any) error }) (ReadingProgress, error) {
 	var p ReadingProgress
 	var lastReadRaw, updatedRaw string
@@ -2182,8 +2577,9 @@ func scanReaderSettings(scanner interface{ Scan(dest ...any) error }) (ReaderSet
 
 func scanRuntimeSettings(scanner interface{ Scan(dest ...any) error }) (RuntimeSettings, error) {
 	var v RuntimeSettings
+	var legacyFrontendPagePrefetchPages int64
 	var createdRaw, updatedRaw string
-	if err := scanner.Scan(&v.ID, &v.MemoryLimitMB, &createdRaw, &updatedRaw); err != nil {
+	if err := scanner.Scan(&v.ID, &v.MemoryLimitMB, &v.DiskCacheMB, &v.PagePrefetchPages, &legacyFrontendPagePrefetchPages, &v.PageLoadParallelism, &v.WebPQuality, &v.WebPMethod, &v.WebPConcurrency, &v.WebPOutputRoot, &createdRaw, &updatedRaw); err != nil {
 		return RuntimeSettings{}, err
 	}
 	var err error

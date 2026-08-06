@@ -109,10 +109,17 @@ type ReaderSettings struct {
 }
 
 type RuntimeSettings struct {
-	ID            int64
-	MemoryLimitMB int64
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                  int64
+	MemoryLimitMB       int64
+	DiskCacheMB         int64
+	PagePrefetchPages   int64
+	PageLoadParallelism int64
+	WebPQuality         int64
+	WebPMethod          int64
+	WebPConcurrency     int64
+	WebPOutputRoot      string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 type ReadingHistoryItem struct {
@@ -126,4 +133,20 @@ type RootDirectory struct {
 	Name      string
 	Path      string
 	CreatedAt time.Time
+}
+
+type WebPArchiveManifest struct {
+	ID               int64
+	SourcePath       string
+	OutputZipPath    string
+	Quality          int64
+	Method           int64
+	SourceMtimeUnix  int64
+	SourceSize       int64
+	SourceEntryCount int
+	ConvertedEntries int
+	KeptEntries      int
+	OutputSize       int64
+	CompletedAt      time.Time
+	UpdatedAt        time.Time
 }
