@@ -12,7 +12,14 @@
   const DEFAULT_LIBRARY_PAGE_SIZE = 100;
   const LIBRARY_PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
   const DEFAULT_RUNTIME_SETTINGS = {
-    memoryLimitMB: 512
+    memoryLimitMB: 512,
+    diskCacheMB: 10240,
+    pagePrefetchPages: 10,
+    pageLoadParallelism: 4,
+    webpQuality: 75,
+    webpMethod: 0,
+    webpConcurrency: 2,
+    webpOutputRoot: ''
   };
   const ENHANCE_MODE_OFF = 'off';
   const ENHANCE_MODE_LEVEL1 = 'level1';
@@ -86,6 +93,15 @@
       lastSeq: 0,
       finalRenderedID: '',
       pollTimer: null
+    },
+    webpConvert: {
+      runningTask: null,
+      items: [],
+      selectedTaskID: '',
+      lastSeq: 0,
+      finalRenderedID: '',
+      pollTimer: null,
+      treeExpanded: new Set()
     },
     nameFormatPreview: {
       id: '',
@@ -193,6 +209,25 @@
 
     scanBtn: document.getElementById('scanBtn'),
     scanStatusText: document.getElementById('scanStatusText'),
+    webpConvertForm: document.getElementById('webpConvertForm'),
+    webpConvertSourceRoot: document.getElementById('webpConvertSourceRoot'),
+    webpConvertSourcePath: document.getElementById('webpConvertSourcePath'),
+    webpConvertBrowseRootBtn: document.getElementById('webpConvertBrowseRootBtn'),
+    webpConvertBrowsePath: document.getElementById('webpConvertBrowsePath'),
+    webpConvertTreeRoot: document.getElementById('webpConvertTreeRoot'),
+    webpConvertOutputRoot: document.getElementById('webpConvertOutputRoot'),
+    webpConvertQuality: document.getElementById('webpConvertQuality'),
+    webpConvertMethod: document.getElementById('webpConvertMethod'),
+    webpConvertConcurrency: document.getElementById('webpConvertConcurrency'),
+    webpConvertSaveDefaultsBtn: document.getElementById('webpConvertSaveDefaultsBtn'),
+    webpConvertRunBtn: document.getElementById('webpConvertRunBtn'),
+    webpConvertTaskRefreshBtn: document.getElementById('webpConvertTaskRefreshBtn'),
+    webpConvertCancelBtn: document.getElementById('webpConvertCancelBtn'),
+    webpConvertTaskList: document.getElementById('webpConvertTaskList'),
+    webpConvertProgressText: document.getElementById('webpConvertProgressText'),
+    webpConvertProgressFill: document.getElementById('webpConvertProgressFill'),
+    webpConvertTaskMeta: document.getElementById('webpConvertTaskMeta'),
+    webpConvertTaskSummary: document.getElementById('webpConvertTaskSummary'),
     archiveWorkflowForm: document.getElementById('archiveWorkflowForm'),
     archiveWorkflowMount: document.getElementById('archiveWorkflowMount'),
     archiveWorkflowPassword: document.getElementById('archiveWorkflowPassword'),
@@ -209,6 +244,9 @@
     archiveWorkflowOutput: document.getElementById('archiveWorkflowOutput'),
     runtimeForm: document.getElementById('runtimeForm'),
     runtimeMemoryLimitMB: document.getElementById('runtimeMemoryLimitMB'),
+    runtimeDiskCacheMB: document.getElementById('runtimeDiskCacheMB'),
+    runtimePagePrefetchPages: document.getElementById('runtimePagePrefetchPages'),
+    runtimePageLoadParallelism: document.getElementById('runtimePageLoadParallelism'),
     mountForm: document.getElementById('mountForm'),
     mountType: document.getElementById('mountType'),
     mountList: document.getElementById('mountList'),
@@ -635,7 +673,9 @@
             await sleep(200 * (attempt + 1));
             continue;
           }
-          throw new Error(message);
+          const err = new Error(message);
+          err.status = resp.status;
+          throw err;
         }
         return data;
       } catch (err) {
@@ -707,6 +747,54 @@
     }
   }
 
+  function renderWebPSourceRootOptions() {
+    if (!el.webpConvertSourceRoot) return;
+    const previous = String(el.webpConvertSourceRoot.value || '');
+    el.webpConvertSourceRoot.innerHTML = '';
+    if (!Array.isArray(state.rootDirectories) || state.rootDirectories.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '请先配置根目录库';
+      el.webpConvertSourceRoot.appendChild(opt);
+      return;
+    }
+    state.rootDirectories.forEach((item) => {
+      const opt = document.createElement('option');
+      opt.value = String(item.id);
+      opt.textContent = `${item.name} · ${normalizeRootPath(item.path || '/')}`;
+      el.webpConvertSourceRoot.appendChild(opt);
+    });
+    const hasPrevious = state.rootDirectories.some((item) => String(item.id) === previous);
+    el.webpConvertSourceRoot.value = hasPrevious ? previous : String(state.rootDirectories[0].id);
+  }
+
+  function renderWebPOutputRootOptions() {
+    if (!el.webpConvertOutputRoot) return;
+    const previousPath = String(state.runtime.webpOutputRoot || '').trim();
+    const previousValue = String(el.webpConvertOutputRoot.value || '');
+    el.webpConvertOutputRoot.innerHTML = '';
+    if (!Array.isArray(state.rootDirectories) || state.rootDirectories.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = '请先配置根目录库';
+      el.webpConvertOutputRoot.appendChild(opt);
+      return;
+    }
+    state.rootDirectories.forEach((item) => {
+      const opt = document.createElement('option');
+      opt.value = String(item.id);
+      opt.textContent = `${item.name} · ${normalizeRootPath(item.path || '/')}`;
+      el.webpConvertOutputRoot.appendChild(opt);
+    });
+    const matchedByPath = state.rootDirectories.find((item) => String(item.path || '').trim() === previousPath);
+    if (matchedByPath) {
+      el.webpConvertOutputRoot.value = String(matchedByPath.id);
+      return;
+    }
+    const hasPreviousValue = state.rootDirectories.some((item) => String(item.id) === previousValue);
+    el.webpConvertOutputRoot.value = hasPreviousValue ? previousValue : String(state.rootDirectories[0].id);
+  }
+
   function setArchiveWorkflowButtonsDisabled(disabled) {
     [el.archiveCollectBtn, el.archiveExtractBtn, el.archiveOrganizeBtn, el.archiveRepackBtn].forEach((btn) => {
       if (btn) btn.disabled = !!disabled;
@@ -734,6 +822,7 @@
     if (key === 'extract') return '解压';
     if (key === 'organize') return '整理';
     if (key === 'repack') return '再压缩';
+    if (key === 'webp_convert') return 'WebP 转换';
     if (key === 'format_names') return '格式化命名';
     return key || '-';
   }
@@ -744,6 +833,7 @@
     if (key === 'running') return '执行中';
     if (key === 'succeeded') return '已完成';
     if (key === 'failed') return '失败';
+    if (key === 'canceled' || key === 'cancelled') return '已取消';
     return key || '未知';
   }
 
@@ -751,6 +841,13 @@
     const ts = line?.created_at ? new Date(line.created_at).toLocaleString() : new Date().toLocaleString();
     const level = String(line?.level || 'info').toUpperCase();
     return `[${ts}] [${level}] ${String(line?.message || '')}`;
+  }
+
+  function formatDateTime(value) {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '-';
+    return date.toLocaleString();
   }
 
   function renderArchiveTaskList() {
@@ -797,7 +894,6 @@
     const selectedID = String(state.archiveTask.selectedID || '');
     if (!selectedID && state.archiveTask.items.length > 0) {
       await selectArchiveTask(state.archiveTask.items[0].id, true);
-      return;
     }
     if (selectedID) {
       const found = state.archiveTask.items.some((item) => String(item.id) === selectedID);
@@ -1030,6 +1126,403 @@
     }, 1800);
   }
 
+  function renderWebPTaskSummary(task) {
+    if (!el.webpConvertTaskSummary) return;
+    if (!task) {
+      el.webpConvertTaskSummary.innerHTML = '<p class="hint">选择任务后显示摘要信息。</p>';
+      return;
+    }
+    const createdAt = formatDateTime(task.created_at);
+    const startedAt = formatDateTime(task.started_at);
+    const finishedAt = formatDateTime(task.finished_at);
+    const errorText = String(task.error || '').trim();
+    const sourcePath = String(task.source_path || '-');
+    const outputDir = String(task.output_dir || '-');
+    const currentArchive = String(task.current_archive || '').trim();
+    el.webpConvertTaskSummary.innerHTML = `
+      <dl class="task-summary-grid">
+        <div><dt>任务ID</dt><dd>${escapeHtml(String(task.id || '-'))}</dd></div>
+        <div><dt>状态</dt><dd>${escapeHtml(archiveTaskStatusText(task.status || ''))}</dd></div>
+        <div><dt>创建时间</dt><dd>${escapeHtml(createdAt)}</dd></div>
+        <div><dt>开始时间</dt><dd>${escapeHtml(startedAt)}</dd></div>
+        <div><dt>结束时间</dt><dd>${escapeHtml(finishedAt)}</dd></div>
+        <div><dt>当前压缩包</dt><dd>${escapeHtml(currentArchive || '-')}</dd></div>
+        <div class="full"><dt>源目录</dt><dd>${escapeHtml(sourcePath)}</dd></div>
+        <div class="full"><dt>输出目录</dt><dd>${escapeHtml(outputDir)}</dd></div>
+        ${errorText ? `<div class="full"><dt>错误</dt><dd class="error-text">${escapeHtml(errorText)}</dd></div>` : ''}
+      </dl>
+    `;
+  }
+
+  function webpTaskItems() {
+    const running = state.webpConvert.runningTask && state.webpConvert.runningTask.id ? [state.webpConvert.runningTask] : [];
+    const items = Array.isArray(state.webpConvert.items) ? state.webpConvert.items : [];
+    return running.concat(items);
+  }
+
+  function renderWebPTaskList() {
+    if (!el.webpConvertTaskList) return;
+    const items = webpTaskItems();
+    el.webpConvertTaskList.innerHTML = '';
+    if (!items.length) {
+      el.webpConvertTaskList.innerHTML = '<li><span class="hint">暂无转换任务</span></li>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    items.forEach((item) => {
+      const li = document.createElement('li');
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `archive-task-item${String(item.id || '') === String(state.webpConvert.selectedTaskID || '') ? ' active' : ''}`;
+      const status = archiveTaskStatusText(item.status);
+      const total = Number(item.progress_total || 0);
+      const done = Number(item.progress_done || 0);
+      btn.innerHTML = `
+        <span class="archive-task-title">${status} · ${done}/${total || 0}</span>
+        <span class="archive-task-line">任务ID: ${String(item.id || '-')}</span>
+        <span class="archive-task-line">源目录: ${String(item.source_path || '-')}</span>
+        <span class="archive-task-line">输出目录: ${String(item.output_dir || '-')}</span>
+      `;
+      btn.addEventListener('click', () => {
+        void selectWebPTask(item.id, true);
+      });
+      li.appendChild(btn);
+      frag.appendChild(li);
+    });
+    el.webpConvertTaskList.appendChild(frag);
+  }
+
+  function renderWebPTaskProgress(task) {
+    const total = Number(task?.progress_total || 0);
+    const done = Number(task?.progress_done || 0);
+    const percent = total > 0 ? Math.max(0, Math.min(100, Math.floor(done * 100 / total))) : 0;
+    if (el.webpConvertProgressFill) {
+      el.webpConvertProgressFill.style.width = `${percent}%`;
+    }
+    const status = String(task?.status || '').toLowerCase();
+    const cancelRequested = !!task?.cancel_requested;
+    const active = status === 'queued' || status === 'running';
+    if (el.webpConvertCancelBtn) {
+      el.webpConvertCancelBtn.disabled = !active || cancelRequested;
+    }
+    if (el.webpConvertProgressText) {
+      const current = String(task?.current_item || '').trim();
+      const phase = String(task?.current_phase || '').trim();
+      const statusText = cancelRequested && active ? '取消中' : archiveTaskStatusText(task?.status || '');
+      el.webpConvertProgressText.textContent = `${statusText} · ${done}/${total}${phase ? ` · ${phase}` : ''}${current ? ` · ${current}` : ''}`;
+    }
+    if (el.webpConvertTaskMeta) {
+      const summary = task?.summary || {};
+      el.webpConvertTaskMeta.textContent = `扫描 ${Number(summary.scanned || 0)} · 命中 ${Number(summary.matched || 0)} · 成功 ${Number(summary.moved || 0)} · 转换图片 ${Number(summary.extracted || 0)} · 保留 WebP ${Number(summary.kept || 0)} · 失败 ${Number(summary.failed || 0)}`;
+    }
+    renderWebPTaskSummary(task);
+  }
+
+  async function loadWebPTasks() {
+    if (!isAdmin) return;
+    const data = await fetchJSON('api/admin/webp/tasks');
+    state.webpConvert.runningTask = data?.running && data.running.id ? data.running : null;
+    state.webpConvert.items = Array.isArray(data?.items) ? data.items : [];
+    renderWebPTaskList();
+
+    const selectedID = String(state.webpConvert.selectedTaskID || '').trim();
+    if (!selectedID) {
+      const next = webpTaskItems();
+      if (next.length > 0) {
+        await selectWebPTask(next[0].id, true);
+      } else {
+        state.webpConvert.lastSeq = 0;
+        state.webpConvert.finalRenderedID = '';
+        renderWebPTaskProgress(null);
+      }
+      return;
+    }
+
+    const found = webpTaskItems().some((item) => String(item.id || '') === selectedID);
+    if (!found) {
+      state.webpConvert.selectedTaskID = '';
+      state.webpConvert.lastSeq = 0;
+      state.webpConvert.finalRenderedID = '';
+      const next = webpTaskItems();
+      if (next.length > 0) {
+        await selectWebPTask(next[0].id, true);
+        return;
+      }
+      renderWebPTaskProgress(null);
+      return;
+    }
+
+    await loadWebPTaskDetail(false);
+    ensureWebPTaskPolling();
+  }
+
+  async function loadWebPTaskDetail(forceResetLog) {
+    const taskID = String(state.webpConvert.selectedTaskID || '').trim();
+    if (!taskID) return;
+    const data = await fetchJSON(`api/admin/webp/tasks/${encodeURIComponent(taskID)}`);
+    const task = data?.task || null;
+    if (!task) return;
+    renderWebPTaskProgress(task);
+    if (forceResetLog) {
+      state.webpConvert.lastSeq = 0;
+      state.webpConvert.finalRenderedID = '';
+    }
+  }
+
+  async function selectWebPTask(taskID, forceResetLog) {
+    const nextID = String(taskID || '').trim();
+    if (!nextID) return;
+    if (String(state.webpConvert.selectedTaskID || '') !== nextID) {
+      state.webpConvert.lastSeq = 0;
+      state.webpConvert.finalRenderedID = '';
+    }
+    state.webpConvert.selectedTaskID = nextID;
+    renderWebPTaskList();
+    await loadWebPTaskDetail(!!forceResetLog);
+  }
+
+  function selectedRootDirectoryByID(selectEl) {
+    if (!selectEl) return null;
+    const selectedID = Number(selectEl.value || 0);
+    if (!Number.isFinite(selectedID) || selectedID <= 0) return null;
+    return state.rootDirectories.find((item) => Number(item.id) === selectedID) || null;
+  }
+
+  function selectedWebPSourceRootPath() {
+    return normalizeRootPath(selectedRootDirectoryByID(el.webpConvertSourceRoot)?.path || '/');
+  }
+
+  function selectedWebPOutputRootPath() {
+    const root = selectedRootDirectoryByID(el.webpConvertOutputRoot);
+    return root ? normalizeRootPath(root.path || '/') : '';
+  }
+
+  async function loadWebPSourceTree(pathValue) {
+    if (!el.webpConvertTreeRoot) return;
+    const root = selectedRootDirectoryByID(el.webpConvertSourceRoot);
+    if (!root) {
+      alert('请先选择一个源根目录');
+      return;
+    }
+    const data = await fetchJSON(`api/admin/root-directories/${root.id}/browse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: String(pathValue || '') })
+    });
+    renderWebPSourceTree(data);
+    if (!String(pathValue || '').trim() && el.webpConvertSourcePath) {
+      el.webpConvertSourcePath.value = String(data?.current_path || selectedWebPSourceRootPath());
+    }
+  }
+
+  function renderWebPSourceTree(data) {
+    if (!el.webpConvertTreeRoot) return;
+    const list = document.createElement('ul');
+    list.className = 'mount-tree-list';
+    const items = Array.isArray(data?.items) ? data.items : [];
+    const currentPath = String(data?.current_path || '').trim();
+    if (el.webpConvertBrowsePath) el.webpConvertBrowsePath.value = currentPath;
+    if (!items.length) {
+      const empty = document.createElement('li');
+      empty.innerHTML = '<span class="hint">当前目录无子目录</span>';
+      list.appendChild(empty);
+    } else {
+      items.forEach((item) => {
+        list.appendChild(buildWebPSourceTreeNode({
+          name: String(item.name || item.path || '/'),
+          path: String(item.path || '')
+        }));
+      });
+    }
+    el.webpConvertTreeRoot.innerHTML = '';
+    el.webpConvertTreeRoot.appendChild(list);
+  }
+
+  function buildWebPSourceTreeNode(node) {
+    const li = document.createElement('li');
+    li.className = 'mount-tree-node';
+    li.dataset.path = node.path;
+
+    const row = document.createElement('div');
+    row.className = 'mount-tree-row';
+    const expanded = state.webpConvert.treeExpanded.has(node.path);
+
+    const toggleBtn = document.createElement('button');
+    toggleBtn.type = 'button';
+    toggleBtn.className = 'mount-tree-toggle';
+    toggleBtn.textContent = expanded ? '▾' : '▸';
+    row.appendChild(toggleBtn);
+
+    const label = document.createElement('button');
+    label.type = 'button';
+    label.className = 'mount-tree-label';
+    label.textContent = node.name;
+    row.appendChild(label);
+
+    const selectBtn = document.createElement('button');
+    selectBtn.type = 'button';
+    selectBtn.className = 'btn';
+    selectBtn.textContent = '选中';
+    selectBtn.addEventListener('click', () => {
+      if (el.webpConvertSourcePath) el.webpConvertSourcePath.value = node.path;
+    });
+    row.appendChild(selectBtn);
+    li.appendChild(row);
+
+    const childWrap = document.createElement('ul');
+    childWrap.className = 'mount-tree-list';
+    childWrap.hidden = !expanded;
+    li.appendChild(childWrap);
+
+    const expandNode = async () => {
+      if (state.webpConvert.treeExpanded.has(node.path)) {
+        state.webpConvert.treeExpanded.delete(node.path);
+        childWrap.hidden = true;
+        toggleBtn.textContent = '▸';
+        return;
+      }
+      state.webpConvert.treeExpanded.add(node.path);
+      toggleBtn.textContent = '▾';
+      if (childWrap.childElementCount === 0) {
+        const root = selectedRootDirectoryByID(el.webpConvertSourceRoot);
+        if (!root) return;
+        const data = await fetchJSON(`api/admin/root-directories/${root.id}/browse`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: node.path })
+        });
+        const items = Array.isArray(data?.items) ? data.items : [];
+        if (!items.length) {
+          const empty = document.createElement('li');
+          empty.innerHTML = '<span class="hint">无子目录</span>';
+          childWrap.appendChild(empty);
+        } else {
+          items.forEach((item) => {
+            childWrap.appendChild(buildWebPSourceTreeNode({
+              name: String(item.name || item.path || '/'),
+              path: String(item.path || '')
+            }));
+          });
+        }
+      }
+      childWrap.hidden = false;
+      if (el.webpConvertBrowsePath) el.webpConvertBrowsePath.value = node.path;
+    };
+
+    toggleBtn.addEventListener('click', () => {
+      void expandNode();
+    });
+    label.addEventListener('click', () => {
+      void expandNode();
+    });
+    return li;
+  }
+
+  async function saveWebPDefaults() {
+    state.runtime.webpQuality = Math.min(100, Math.max(1, Math.floor(Number(el.webpConvertQuality?.value || state.runtime.webpQuality))));
+    state.runtime.webpMethod = Math.min(6, Math.max(0, Math.floor(Number(el.webpConvertMethod?.value || state.runtime.webpMethod))));
+    state.runtime.webpConcurrency = Math.min(16, Math.max(1, Math.floor(Number(el.webpConvertConcurrency?.value || state.runtime.webpConcurrency))));
+    state.runtime.webpOutputRoot = selectedWebPOutputRootPath();
+    await saveRuntimeSettingsNow();
+    renderWebPOutputRootOptions();
+    syncRuntimeSettingsToControls();
+  }
+
+  async function runWebPConvertTask() {
+    const sourceRootID = Number(el.webpConvertSourceRoot?.value || 0);
+    const outputRootID = Number(el.webpConvertOutputRoot?.value || 0);
+    const sourcePath = String(el.webpConvertSourcePath?.value || '').trim();
+    const webpQuality = Math.min(100, Math.max(1, Math.floor(Number(el.webpConvertQuality?.value || 75))));
+    const webpMethod = Math.min(6, Math.max(0, Math.floor(Number(el.webpConvertMethod?.value || 0))));
+    const webpConcurrency = Math.min(16, Math.max(1, Math.floor(Number(el.webpConvertConcurrency?.value || 2))));
+    if (!Number.isFinite(sourceRootID) || sourceRootID <= 0) {
+      alert('请先选择源根目录');
+      return;
+    }
+    if (!sourcePath) {
+      alert('请先从目录树中选择扫描源目录');
+      return;
+    }
+    if (!Number.isFinite(outputRootID) || outputRootID <= 0) {
+      alert('请先选择输出根目录');
+      return;
+    }
+
+    if (el.webpConvertRunBtn) el.webpConvertRunBtn.disabled = true;
+    try {
+      const data = await fetchJSON('api/admin/webp/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_root_id: sourceRootID,
+          source_path: sourcePath,
+          output_root_id: outputRootID,
+          webp_quality: webpQuality,
+          webp_method: webpMethod,
+          webp_concurrency: webpConcurrency
+        })
+      });
+      const task = data?.task || null;
+      if (!task?.id) {
+        throw new Error('后台任务创建失败：未返回任务ID');
+      }
+      state.webpConvert.selectedTaskID = String(task.id);
+      state.webpConvert.lastSeq = 0;
+      state.webpConvert.finalRenderedID = '';
+      await loadWebPTasks();
+      await selectWebPTask(task.id, true);
+      ensureWebPTaskPolling();
+    } catch (err) {
+      alert('执行失败: ' + (err?.message || String(err)));
+    } finally {
+      if (el.webpConvertRunBtn) el.webpConvertRunBtn.disabled = false;
+    }
+  }
+
+  async function cancelWebPTask() {
+    const taskID = String(state.webpConvert.selectedTaskID || '').trim();
+    if (!taskID) {
+      alert('请先选择一个任务');
+      return;
+    }
+    if (!confirm(`确认取消 WebP 转换任务 ${taskID} ?`)) {
+      return;
+    }
+    if (el.webpConvertCancelBtn) el.webpConvertCancelBtn.disabled = true;
+    try {
+      await fetchJSON(`api/admin/webp/tasks/${encodeURIComponent(taskID)}/cancel`, {
+        method: 'POST'
+      });
+    } catch (err) {
+      alert('取消失败: ' + (err?.message || String(err)));
+    } finally {
+      await loadWebPTasks().catch(() => {});
+      ensureWebPTaskPolling();
+    }
+  }
+
+  function hasActiveWebPTask() {
+    return webpTaskItems().some((item) => {
+      const status = String(item?.status || '').toLowerCase();
+      return status === 'queued' || status === 'running';
+    });
+  }
+
+  function ensureWebPTaskPolling() {
+    if (!isAdmin) return;
+    if (state.webpConvert.pollTimer) return;
+    if (!hasActiveWebPTask()) return;
+    state.webpConvert.pollTimer = setInterval(async () => {
+      try {
+        await loadWebPTasks();
+        if (!hasActiveWebPTask() && state.webpConvert.pollTimer) {
+          clearInterval(state.webpConvert.pollTimer);
+          state.webpConvert.pollTimer = null;
+        }
+      } catch (_) {}
+    }, 1800);
+  }
+
   async function runArchiveWorkflow(action) {
     if (!isAdmin) return;
     if (!el.archiveWorkflowMount) {
@@ -1166,13 +1659,46 @@
 
   function normalizeRuntimeSettings(payload) {
     const memoryRaw = Number(payload?.memory_limit_mb ?? payload?.memoryLimitMB ?? DEFAULT_RUNTIME_SETTINGS.memoryLimitMB);
+    const diskRaw = Number(payload?.disk_cache_mb ?? payload?.diskCacheMB ?? DEFAULT_RUNTIME_SETTINGS.diskCacheMB);
+    const prefetchRaw = Number(payload?.page_prefetch_pages ?? payload?.pagePrefetchPages ?? DEFAULT_RUNTIME_SETTINGS.pagePrefetchPages);
+    const pageLoadParallelismRaw = Number(
+      payload?.page_load_parallelism
+        ?? payload?.pageLoadParallelism
+        ?? DEFAULT_RUNTIME_SETTINGS.pageLoadParallelism
+    );
     const memoryLimitMB = Number.isFinite(memoryRaw) ? Math.min(32768, Math.max(256, Math.floor(memoryRaw))) : DEFAULT_RUNTIME_SETTINGS.memoryLimitMB;
-    return { memoryLimitMB };
+    const diskCacheMB = Number.isFinite(diskRaw) ? Math.min(1048576, Math.max(256, Math.floor(diskRaw))) : DEFAULT_RUNTIME_SETTINGS.diskCacheMB;
+    const pagePrefetchPages = Number.isFinite(prefetchRaw) ? Math.min(100, Math.max(1, Math.floor(prefetchRaw))) : DEFAULT_RUNTIME_SETTINGS.pagePrefetchPages;
+    const pageLoadParallelism = Number.isFinite(pageLoadParallelismRaw)
+      ? Math.min(16, Math.max(1, Math.floor(pageLoadParallelismRaw)))
+      : DEFAULT_RUNTIME_SETTINGS.pageLoadParallelism;
+    const webpQualityRaw = Number(payload?.webp_quality ?? payload?.webpQuality ?? DEFAULT_RUNTIME_SETTINGS.webpQuality);
+    const webpMethodRaw = Number(payload?.webp_method ?? payload?.webpMethod ?? DEFAULT_RUNTIME_SETTINGS.webpMethod);
+    const webpConcurrencyRaw = Number(payload?.webp_concurrency ?? payload?.webpConcurrency ?? DEFAULT_RUNTIME_SETTINGS.webpConcurrency);
+    const webpQuality = Number.isFinite(webpQualityRaw) ? Math.min(100, Math.max(1, Math.floor(webpQualityRaw))) : DEFAULT_RUNTIME_SETTINGS.webpQuality;
+    const webpMethod = Number.isFinite(webpMethodRaw) ? Math.min(6, Math.max(0, Math.floor(webpMethodRaw))) : DEFAULT_RUNTIME_SETTINGS.webpMethod;
+    const webpConcurrency = Number.isFinite(webpConcurrencyRaw) ? Math.min(16, Math.max(1, Math.floor(webpConcurrencyRaw))) : DEFAULT_RUNTIME_SETTINGS.webpConcurrency;
+    const webpOutputRoot = String((payload?.webp_output_root ?? payload?.webpOutputRoot ?? DEFAULT_RUNTIME_SETTINGS.webpOutputRoot) || '').trim();
+    return { memoryLimitMB, diskCacheMB, pagePrefetchPages, pageLoadParallelism, webpQuality, webpMethod, webpConcurrency, webpOutputRoot };
   }
 
   function syncRuntimeSettingsToControls() {
     if (!el.runtimeMemoryLimitMB) return;
     el.runtimeMemoryLimitMB.value = String(state.runtime.memoryLimitMB);
+    if (el.runtimeDiskCacheMB) el.runtimeDiskCacheMB.value = String(state.runtime.diskCacheMB);
+    if (el.runtimePagePrefetchPages) el.runtimePagePrefetchPages.value = String(state.runtime.pagePrefetchPages);
+    if (el.runtimePageLoadParallelism) {
+      el.runtimePageLoadParallelism.value = String(state.runtime.pageLoadParallelism);
+    }
+    if (el.webpConvertQuality) el.webpConvertQuality.value = String(state.runtime.webpQuality);
+    if (el.webpConvertMethod) el.webpConvertMethod.value = String(state.runtime.webpMethod);
+    if (el.webpConvertConcurrency) el.webpConvertConcurrency.value = String(state.runtime.webpConcurrency);
+    if (el.webpConvertOutputRoot) {
+      const matched = state.rootDirectories.find((item) => String(item.path || '').trim() === String(state.runtime.webpOutputRoot || '').trim());
+      if (matched) {
+        el.webpConvertOutputRoot.value = String(matched.id);
+      }
+    }
   }
 
   async function loadRuntimeSettings() {
@@ -1187,7 +1713,14 @@
 
   async function saveRuntimeSettingsNow() {
     const payload = {
-      memory_limit_mb: state.runtime.memoryLimitMB
+      memory_limit_mb: state.runtime.memoryLimitMB,
+      disk_cache_mb: state.runtime.diskCacheMB,
+      page_prefetch_pages: state.runtime.pagePrefetchPages,
+      page_load_parallelism: state.runtime.pageLoadParallelism,
+      webp_quality: state.runtime.webpQuality,
+      webp_method: state.runtime.webpMethod,
+      webp_concurrency: state.runtime.webpConcurrency,
+      webp_output_root: state.runtime.webpOutputRoot
     };
     const data = await fetchJSON('api/admin/runtime', {
       method: 'PUT',
@@ -1329,6 +1862,8 @@
     if (isAdmin) {
       if (el.mountList) renderMountList();
       renderArchiveWorkflowMountOptions();
+      renderWebPSourceRootOptions();
+      renderWebPOutputRootOptions();
     }
   }
 
@@ -1669,7 +2204,17 @@
     if (!readerComicID) return;
     nextReaderRenderEpoch();
     await destroyReaderPDF();
-    const detail = await fetchJSON(`api/comics/${readerComicID}`);
+    let detail;
+    try {
+      detail = await fetchJSON(`api/comics/${readerComicID}`);
+    } catch (err) {
+      if (err?.status === 404) {
+        alert('当前漫画已不存在或已重新扫描，请从书库重新打开。');
+        location.href = appURL('./');
+        return;
+      }
+      throw err;
+    }
     if (!detail?.comic) return;
 
     state.reader.comic = detail.comic;
@@ -1695,7 +2240,14 @@
       saveSettings();
     }
 
-    const progress = await fetchJSON(`api/comics/${readerComicID}/progress`);
+    const progressParams = new URLSearchParams();
+    if (detail.comic.file_name_key) {
+      progressParams.set('comic_file_name_key', String(detail.comic.file_name_key));
+    }
+    const progressURL = progressParams.size > 0
+      ? `api/comics/${readerComicID}/progress?${progressParams.toString()}`
+      : `api/comics/${readerComicID}/progress`;
+    const progress = await fetchJSON(progressURL);
     if (progress?.progress) {
       state.reader.currentPage = clampPage(progress.progress.last_page || 0);
       if (!state.reader.pageCountKnown) {
@@ -2200,17 +2752,6 @@
 
     updateReaderProgressText();
     scheduleSaveProgress();
-
-    const step = state.reader.spread === 'double' ? 2 : 1;
-    const prefetchWidth = computeRequestedWidth(el.pagedSlotLeft);
-    for (let i = 1; i <= step; i += 1) {
-      const idx = page + i;
-      if (state.reader.pageCountKnown) {
-        if (idx < state.reader.totalPages) getImage(idx, prefetchWidth).catch(() => {});
-      } else {
-        getImage(idx, prefetchWidth).catch(() => {});
-      }
-    }
   }
 
   function renderScrollScaffold(preservePosition) {
@@ -2731,12 +3272,37 @@
       el.runtimeForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const memoryLimitMB = Math.floor(Number(el.runtimeMemoryLimitMB?.value || DEFAULT_RUNTIME_SETTINGS.memoryLimitMB));
+        const diskCacheMB = Math.floor(Number(el.runtimeDiskCacheMB?.value || DEFAULT_RUNTIME_SETTINGS.diskCacheMB));
+        const pagePrefetchPages = Math.floor(Number(el.runtimePagePrefetchPages?.value || DEFAULT_RUNTIME_SETTINGS.pagePrefetchPages));
+        const pageLoadParallelism = Math.floor(
+          Number(el.runtimePageLoadParallelism?.value || DEFAULT_RUNTIME_SETTINGS.pageLoadParallelism)
+        );
         if (!Number.isFinite(memoryLimitMB) || memoryLimitMB < 256 || memoryLimitMB > 32768) {
           alert('内存上限必须在 256-32768 MB');
           el.runtimeMemoryLimitMB?.focus();
           return;
         }
-        state.runtime = { memoryLimitMB };
+        if (!Number.isFinite(diskCacheMB) || diskCacheMB < 256 || diskCacheMB > 1048576) {
+          alert('磁盘缓存上限必须在 256-1048576 MB');
+          el.runtimeDiskCacheMB?.focus();
+          return;
+        }
+        if (!Number.isFinite(pagePrefetchPages) || pagePrefetchPages < 1 || pagePrefetchPages > 100) {
+          alert('页面预取数量必须在 1-100');
+          el.runtimePagePrefetchPages?.focus();
+          return;
+        }
+        if (!Number.isFinite(pageLoadParallelism) || pageLoadParallelism < 1 || pageLoadParallelism > 16) {
+          alert('单漫画缓存加载并行页数必须在 1-16');
+          el.runtimePageLoadParallelism?.focus();
+          return;
+        }
+        state.runtime = {
+          memoryLimitMB,
+          diskCacheMB,
+          pagePrefetchPages,
+          pageLoadParallelism
+        };
         try {
           await saveRuntimeSettingsNow();
           alert('运行时设置已保存并生效');
@@ -2917,6 +3483,8 @@
     state.rootDirectories = Array.isArray(data?.items) ? data.items : [];
     renderRootDirectoryList();
     renderRootDirectorySelect();
+    renderWebPSourceRootOptions();
+    renderWebPOutputRootOptions();
   }
 
   async function submitRootDirectoryForm(e) {
@@ -3362,6 +3930,14 @@
     if (hasActiveArchiveTask()) {
       ensureArchiveTaskPolling();
     }
+    await loadWebPTasks();
+    if (state.rootDirectories.length > 0) {
+      try {
+        await loadWebPSourceTree('');
+      } catch (err) {
+        renderWebPTaskSummary(null);
+      }
+    }
     resetNameFormatPreviewState();
 
     setMountTypeUI();
@@ -3464,6 +4040,56 @@
         }
       });
     }
+    if (el.webpConvertSourceRoot && el.webpConvertSourceRoot.dataset.bound !== '1') {
+      el.webpConvertSourceRoot.dataset.bound = '1';
+      el.webpConvertSourceRoot.addEventListener('change', async () => {
+        state.webpConvert.treeExpanded.clear();
+        if (el.webpConvertSourcePath) el.webpConvertSourcePath.value = '';
+        if (el.webpConvertTreeRoot) el.webpConvertTreeRoot.innerHTML = '';
+        if (el.webpConvertBrowsePath) el.webpConvertBrowsePath.value = '';
+        try {
+          await loadWebPSourceTree('');
+        } catch (err) {
+          alert('加载目录失败: ' + (err?.message || String(err)));
+        }
+      });
+    }
+    if (el.webpConvertBrowseRootBtn && el.webpConvertBrowseRootBtn.dataset.bound !== '1') {
+      el.webpConvertBrowseRootBtn.dataset.bound = '1';
+      el.webpConvertBrowseRootBtn.addEventListener('click', async () => {
+        state.webpConvert.treeExpanded.clear();
+        try {
+          await loadWebPSourceTree('');
+        } catch (err) {
+          alert('加载目录失败: ' + (err?.message || String(err)));
+        }
+      });
+    }
+    if (el.webpConvertSaveDefaultsBtn && el.webpConvertSaveDefaultsBtn.dataset.bound !== '1') {
+      el.webpConvertSaveDefaultsBtn.dataset.bound = '1';
+      el.webpConvertSaveDefaultsBtn.addEventListener('click', () => {
+        void saveWebPDefaults();
+      });
+    }
+    if (el.webpConvertRunBtn && el.webpConvertRunBtn.dataset.bound !== '1') {
+      el.webpConvertRunBtn.dataset.bound = '1';
+      el.webpConvertRunBtn.addEventListener('click', () => {
+        void runWebPConvertTask();
+      });
+    }
+    if (el.webpConvertTaskRefreshBtn && el.webpConvertTaskRefreshBtn.dataset.bound !== '1') {
+      el.webpConvertTaskRefreshBtn.dataset.bound = '1';
+      el.webpConvertTaskRefreshBtn.addEventListener('click', async () => {
+        await loadWebPTasks();
+      });
+    }
+    if (el.webpConvertCancelBtn && el.webpConvertCancelBtn.dataset.bound !== '1') {
+      el.webpConvertCancelBtn.dataset.bound = '1';
+      el.webpConvertCancelBtn.addEventListener('click', () => {
+        void cancelWebPTask();
+      });
+    }
+    renderWebPTaskSummary(null);
 
     if (el.mountBrowseRootBtn) {
       el.mountBrowseRootBtn.click();
@@ -3501,7 +4127,11 @@
 
   init();
 
-  window.addEventListener('unload', () => {
+  let appCleanedUp = false;
+
+  function cleanupAppResources() {
+    if (appCleanedUp) return;
+    appCleanedUp = true;
     if (scanTimer) clearInterval(scanTimer);
     if (state.archiveTask.pollTimer) clearInterval(state.archiveTask.pollTimer);
     if (libraryScrollTimer) clearTimeout(libraryScrollTimer);
@@ -3520,5 +4150,7 @@
     if (state.windowScrollBound) window.removeEventListener('scroll', onWindowScroll);
     window.removeEventListener('scroll', onLibraryScroll);
     void destroyReaderPDF();
-  });
+  }
+
+  window.addEventListener('pagehide', cleanupAppResources, { capture: true });
 })();

@@ -1,0 +1,10 @@
+testdata/*.png
+testdata/*.webp
+
+# Go test/benchmark artifacts
+*.test
+*.prof
+*.out
+
+# Compiled CLI binary (go build ./cmd/gowebp)
+/gowebp

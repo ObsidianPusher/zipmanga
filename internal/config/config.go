@@ -48,7 +48,14 @@ type ScanConfig struct {
 }
 
 type RuntimeConfig struct {
-	MemoryLimitMB int64 `json:"memory_limit_mb"`
+	MemoryLimitMB       int64  `json:"memory_limit_mb"`
+	DiskCacheMB         int64  `json:"disk_cache_mb"`
+	PagePrefetchPages   int64  `json:"page_prefetch_pages"`
+	PageLoadParallelism int64  `json:"page_load_parallelism"`
+	WebPQuality         int64  `json:"webp_quality"`
+	WebPMethod          int64  `json:"webp_method"`
+	WebPConcurrency     int64  `json:"webp_concurrency"`
+	WebPOutputRoot      string `json:"webp_output_root"`
 }
 
 type BootstrapConfig struct {
@@ -76,7 +83,13 @@ func Default() Config {
 			Interval: "15m",
 		},
 		Runtime: RuntimeConfig{
-			MemoryLimitMB: 512,
+			MemoryLimitMB:       512,
+			DiskCacheMB:         10240,
+			PagePrefetchPages:   10,
+			PageLoadParallelism: 4,
+			WebPQuality:         75,
+			WebPMethod:          0,
+			WebPConcurrency:     2,
 		},
 		BootstrapAdmin: BootstrapConfig{
 			Username: "admin",
@@ -174,6 +187,24 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.Runtime.MemoryLimitMB <= 0 {
 		c.Runtime.MemoryLimitMB = def.Runtime.MemoryLimitMB
 	}
+	if c.Runtime.DiskCacheMB <= 0 {
+		c.Runtime.DiskCacheMB = def.Runtime.DiskCacheMB
+	}
+	if c.Runtime.PagePrefetchPages < 0 {
+		c.Runtime.PagePrefetchPages = def.Runtime.PagePrefetchPages
+	}
+	if c.Runtime.PageLoadParallelism <= 0 {
+		c.Runtime.PageLoadParallelism = def.Runtime.PageLoadParallelism
+	}
+	if c.Runtime.WebPQuality <= 0 {
+		c.Runtime.WebPQuality = def.Runtime.WebPQuality
+	}
+	if c.Runtime.WebPMethod < 0 {
+		c.Runtime.WebPMethod = def.Runtime.WebPMethod
+	}
+	if c.Runtime.WebPConcurrency <= 0 {
+		c.Runtime.WebPConcurrency = def.Runtime.WebPConcurrency
+	}
 	if c.BootstrapAdmin.Username == "" {
 		c.BootstrapAdmin.Username = def.BootstrapAdmin.Username
 	}
@@ -204,6 +235,27 @@ func (c Config) Validate() error {
 	}
 	if c.Runtime.MemoryLimitMB < 256 {
 		return errors.New("runtime.memory_limit_mb must be >= 256")
+	}
+	if c.Runtime.DiskCacheMB < 256 {
+		return errors.New("runtime.disk_cache_mb must be >= 256")
+	}
+	if c.Runtime.PagePrefetchPages < 0 {
+		return errors.New("runtime.page_prefetch_pages must be >= 0")
+	}
+	if c.Runtime.PageLoadParallelism < 1 {
+		return errors.New("runtime.page_load_parallelism must be >= 1")
+	}
+	if c.Runtime.PageLoadParallelism > 16 {
+		return errors.New("runtime.page_load_parallelism must be <= 16")
+	}
+	if c.Runtime.WebPQuality < 1 || c.Runtime.WebPQuality > 100 {
+		return errors.New("runtime.webp_quality must be between 1 and 100")
+	}
+	if c.Runtime.WebPMethod < 0 || c.Runtime.WebPMethod > 6 {
+		return errors.New("runtime.webp_method must be between 0 and 6")
+	}
+	if c.Runtime.WebPConcurrency < 1 || c.Runtime.WebPConcurrency > 16 {
+		return errors.New("runtime.webp_concurrency must be between 1 and 16")
 	}
 
 	if c.Database.Path == "" {

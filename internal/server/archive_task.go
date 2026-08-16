@@ -30,11 +30,19 @@ type archiveTaskLogLine struct {
 }
 
 type archiveWorkflowTask struct {
-	ID        string            `json:"id"`
-	Action    string            `json:"action"`
-	MountID   int64             `json:"mount_id"`
-	MountName string            `json:"mount_name"`
-	Status    archiveTaskStatus `json:"status"`
+	ID            string            `json:"id"`
+	Action        string            `json:"action"`
+	MountID       int64             `json:"mount_id"`
+	MountName     string            `json:"mount_name"`
+	Status        archiveTaskStatus `json:"status"`
+	SourcePath    string            `json:"source_path,omitempty"`
+	OutputRoot    string            `json:"output_root,omitempty"`
+	WebPQuality   int64             `json:"webp_quality,omitempty"`
+	WebPMethod    int64             `json:"webp_method,omitempty"`
+	ProgressTotal int               `json:"progress_total"`
+	ProgressDone  int               `json:"progress_done"`
+	CurrentItem   string            `json:"current_item,omitempty"`
+	CurrentPhase  string            `json:"current_phase,omitempty"`
 
 	CreatedAt  time.Time `json:"created_at"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
@@ -48,7 +56,7 @@ type archiveWorkflowTask struct {
 }
 
 func (s *Server) handleAPIAdminArchiveWorkflowCreateTask(w http.ResponseWriter, r *http.Request) {
-	action, mount, password, err := s.decodeArchiveTaskCreateRequest(r)
+	req, err := s.decodeArchiveTaskCreateRequest(r)
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "internal:") {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": strings.TrimPrefix(err.Error(), "internal: ")})
@@ -58,8 +66,8 @@ func (s *Server) handleAPIAdminArchiveWorkflowCreateTask(w http.ResponseWriter, 
 		return
 	}
 
-	task := s.createArchiveTask(action, mount)
-	go s.runArchiveTask(task.ID, mount, password)
+	task := s.createArchiveTask(req)
+	go s.runArchiveTask(task.ID, req)
 
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok":   true,
@@ -93,40 +101,69 @@ func (s *Server) handleAPIAdminArchiveWorkflowGetTask(w http.ResponseWriter, r *
 	})
 }
 
-func (s *Server) decodeArchiveTaskCreateRequest(r *http.Request) (string, db.Mount, string, error) {
+type archiveTaskCreateRequest struct {
+	Action      string
+	Mount       db.Mount
+	Password    string
+	SourcePath  string
+	OutputRoot  string
+	WebPQuality int64
+	WebPMethod  int64
+}
+
+func (s *Server) decodeArchiveTaskCreateRequest(r *http.Request) (archiveTaskCreateRequest, error) {
 	var req struct {
-		Action   string `json:"action"`
-		MountID  int64  `json:"mount_id"`
-		Password string `json:"password"`
+		Action      string `json:"action"`
+		MountID     int64  `json:"mount_id"`
+		Password    string `json:"password"`
+		SourcePath  string `json:"source_path"`
+		OutputRoot  string `json:"output_root"`
+		WebPQuality *int64 `json:"webp_quality"`
+		WebPMethod  *int64 `json:"webp_method"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
-		return "", db.Mount{}, "", err
+		return archiveTaskCreateRequest{}, err
 	}
 
 	action := strings.ToLower(strings.TrimSpace(req.Action))
 	switch action {
 	case archiveActionCollect, archiveActionExtract, archiveActionOrganize, archiveActionRepack:
 	default:
-		return "", db.Mount{}, "", errors.New("unsupported action")
+		return archiveTaskCreateRequest{}, errors.New("unsupported action")
 	}
 	if req.MountID <= 0 {
-		return "", db.Mount{}, "", errors.New("mount_id must be positive")
+		return archiveTaskCreateRequest{}, errors.New("mount_id must be positive")
 	}
 
 	mount, err := s.store.GetMount(req.MountID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", db.Mount{}, "", errors.New("mount not found")
+			return archiveTaskCreateRequest{}, errors.New("mount not found")
 		}
-		return "", db.Mount{}, "", fmt.Errorf("internal: query mount failed: %w", err)
+		return archiveTaskCreateRequest{}, fmt.Errorf("internal: query mount failed: %w", err)
 	}
 	if mount.Type != db.MountTypeLocal {
-		return "", db.Mount{}, "", errors.New("archive workflow only supports local mounts")
+		return archiveTaskCreateRequest{}, errors.New("archive workflow only supports local mounts")
 	}
-	return action, mount, req.Password, nil
+	out := archiveTaskCreateRequest{
+		Action:      action,
+		Mount:       mount,
+		Password:    req.Password,
+		SourcePath:  strings.TrimSpace(req.SourcePath),
+		OutputRoot:  strings.TrimSpace(req.OutputRoot),
+		WebPQuality: s.currentRuntimeConfig().WebPQuality,
+		WebPMethod:  s.currentRuntimeConfig().WebPMethod,
+	}
+	if req.WebPQuality != nil {
+		out.WebPQuality = *req.WebPQuality
+	}
+	if req.WebPMethod != nil {
+		out.WebPMethod = *req.WebPMethod
+	}
+	return out, nil
 }
 
-func (s *Server) createArchiveTask(action string, mount db.Mount) archiveWorkflowTask {
+func (s *Server) createArchiveTask(req archiveTaskCreateRequest) archiveWorkflowTask {
 	s.archiveTaskMu.Lock()
 	defer s.archiveTaskMu.Unlock()
 
@@ -134,14 +171,18 @@ func (s *Server) createArchiveTask(action string, mount db.Mount) archiveWorkflo
 	id := fmt.Sprintf("awt_%d_%04d", time.Now().Unix(), s.archiveTaskSeq%10000)
 	now := time.Now()
 	task := archiveWorkflowTask{
-		ID:        id,
-		Action:    action,
-		MountID:   mount.ID,
-		MountName: mount.Name,
-		Status:    archiveTaskQueued,
-		CreatedAt: now,
-		Roots:     make([]archiveWorkflowRootResult, 0, 4),
-		Logs:      make([]archiveTaskLogLine, 0, 128),
+		ID:          id,
+		Action:      req.Action,
+		MountID:     req.Mount.ID,
+		MountName:   req.Mount.Name,
+		Status:      archiveTaskQueued,
+		SourcePath:  req.SourcePath,
+		OutputRoot:  req.OutputRoot,
+		WebPQuality: req.WebPQuality,
+		WebPMethod:  req.WebPMethod,
+		CreatedAt:   now,
+		Roots:       make([]archiveWorkflowRootResult, 0, 4),
+		Logs:        make([]archiveTaskLogLine, 0, 128),
 	}
 	s.archiveTasks[id] = &task
 	s.archiveTaskOrder = append(s.archiveTaskOrder, id)
@@ -149,7 +190,8 @@ func (s *Server) createArchiveTask(action string, mount db.Mount) archiveWorkflo
 	return task
 }
 
-func (s *Server) runArchiveTask(taskID string, mount db.Mount, password string) {
+func (s *Server) runArchiveTask(taskID string, req archiveTaskCreateRequest) {
+	mount := req.Mount
 	maskPassword := func(v string) string {
 		if strings.TrimSpace(v) == "" {
 			return "(empty)"
@@ -158,7 +200,7 @@ func (s *Server) runArchiveTask(taskID string, mount db.Mount, password string) 
 	}
 
 	s.setArchiveTaskRunning(taskID)
-	s.appendArchiveTaskLog(taskID, "info", "$ archive-workflow %s --mount %d --password %s", s.archiveTaskAction(taskID), mount.ID, maskPassword(password))
+	s.appendArchiveTaskLog(taskID, "info", "$ archive-workflow %s --mount %d --password %s", s.archiveTaskAction(taskID), mount.ID, maskPassword(req.Password))
 
 	roots := mount.RootPaths
 	if len(roots) == 0 && strings.TrimSpace(mount.RootPath) != "" {
@@ -191,7 +233,7 @@ func (s *Server) runArchiveTask(taskID string, mount db.Mount, password string) 
 		}
 
 		s.appendArchiveTaskLog(taskID, "info", "$ run %s --root %q", taskAction, normalized)
-		stats, errs, runErr := runArchiveWorkflowOnRoot(taskAction, normalized, password)
+		stats, errs, runErr := runArchiveWorkflowOnRoot(taskAction, normalized, req.Password)
 		if runErr != nil {
 			errs = append(errs, runErr.Error())
 			stats.Failed++
@@ -243,7 +285,26 @@ func (s *Server) finishArchiveTask(taskID string, status archiveTaskStatus, summ
 	task.Summary = summary
 	task.Error = strings.TrimSpace(finalErr)
 	task.FinishedAt = time.Now()
+	task.CurrentPhase = ""
 	task.Roots = append([]archiveWorkflowRootResult(nil), roots...)
+}
+
+func (s *Server) updateArchiveTaskProgress(taskID string, total, done int, currentItem, currentPhase string, summary archiveWorkflowStats) {
+	s.archiveTaskMu.Lock()
+	defer s.archiveTaskMu.Unlock()
+	task, ok := s.archiveTasks[taskID]
+	if !ok {
+		return
+	}
+	if total >= 0 {
+		task.ProgressTotal = total
+	}
+	if done >= 0 {
+		task.ProgressDone = done
+	}
+	task.CurrentItem = strings.TrimSpace(currentItem)
+	task.CurrentPhase = strings.TrimSpace(currentPhase)
+	task.Summary = summary
 }
 
 func (s *Server) appendArchiveTaskLog(taskID, level, format string, args ...any) {
@@ -304,17 +365,25 @@ func (s *Server) listArchiveTaskBrief(limit int) []map[string]any {
 
 func archiveTaskBriefDTO(task archiveWorkflowTask) map[string]any {
 	return map[string]any{
-		"id":          task.ID,
-		"action":      task.Action,
-		"mount_id":    task.MountID,
-		"mount_name":  task.MountName,
-		"status":      task.Status,
-		"created_at":  task.CreatedAt,
-		"started_at":  task.StartedAt,
-		"finished_at": task.FinishedAt,
-		"summary":     task.Summary,
-		"error":       task.Error,
-		"last_seq":    task.LastSeq,
+		"id":             task.ID,
+		"action":         task.Action,
+		"mount_id":       task.MountID,
+		"mount_name":     task.MountName,
+		"source_path":    task.SourcePath,
+		"output_root":    task.OutputRoot,
+		"webp_quality":   task.WebPQuality,
+		"webp_method":    task.WebPMethod,
+		"status":         task.Status,
+		"created_at":     task.CreatedAt,
+		"started_at":     task.StartedAt,
+		"finished_at":    task.FinishedAt,
+		"progress_total": task.ProgressTotal,
+		"progress_done":  task.ProgressDone,
+		"current_item":   task.CurrentItem,
+		"current_phase":  task.CurrentPhase,
+		"summary":        task.Summary,
+		"error":          task.Error,
+		"last_seq":       task.LastSeq,
 	}
 }
 
@@ -338,18 +407,26 @@ func (s *Server) getArchiveTaskSnapshot(taskID string, afterSeq uint64) (map[str
 	}
 
 	taskDTO := map[string]any{
-		"id":          task.ID,
-		"action":      task.Action,
-		"mount_id":    task.MountID,
-		"mount_name":  task.MountName,
-		"status":      task.Status,
-		"created_at":  task.CreatedAt,
-		"started_at":  task.StartedAt,
-		"finished_at": task.FinishedAt,
-		"summary":     task.Summary,
-		"roots":       append([]archiveWorkflowRootResult(nil), task.Roots...),
-		"error":       task.Error,
-		"last_seq":    task.LastSeq,
+		"id":             task.ID,
+		"action":         task.Action,
+		"mount_id":       task.MountID,
+		"mount_name":     task.MountName,
+		"source_path":    task.SourcePath,
+		"output_root":    task.OutputRoot,
+		"webp_quality":   task.WebPQuality,
+		"webp_method":    task.WebPMethod,
+		"status":         task.Status,
+		"created_at":     task.CreatedAt,
+		"started_at":     task.StartedAt,
+		"finished_at":    task.FinishedAt,
+		"progress_total": task.ProgressTotal,
+		"progress_done":  task.ProgressDone,
+		"current_item":   task.CurrentItem,
+		"current_phase":  task.CurrentPhase,
+		"summary":        task.Summary,
+		"roots":          append([]archiveWorkflowRootResult(nil), task.Roots...),
+		"error":          task.Error,
+		"last_seq":       task.LastSeq,
 	}
 	return taskDTO, logs, true
 }

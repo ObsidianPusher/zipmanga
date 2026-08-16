@@ -32,6 +32,11 @@ type ProbeResult struct {
 	CoverJPEG []byte
 }
 
+type PageImageData struct {
+	Name string
+	Data []byte
+}
+
 var errLikelyBlankCover = errors.New("image is likely blank")
 
 func Probe(provider mounts.Provider, relPath string, format comicfmt.Format, opt ProbeOptions) (ProbeResult, error) {
@@ -81,6 +86,23 @@ func PageImage(provider mounts.Provider, relPath string, format comicfmt.Format,
 
 func FirstImage(provider mounts.Provider, relPath string, format comicfmt.Format, maxBytes int64) (string, []byte, error) {
 	return PageImage(provider, relPath, format, 0, maxBytes)
+}
+
+func PageImages(provider mounts.Provider, relPath string, format comicfmt.Format, indexes []int, maxBytes int64) (map[int]PageImageData, error) {
+	sorted := normalizePageIndexes(indexes)
+	if len(sorted) == 0 {
+		return map[int]PageImageData{}, nil
+	}
+	switch format {
+	case comicfmt.FormatZIP:
+		return pageImagesFromZIP(provider, relPath, sorted, maxBytes)
+	case comicfmt.Format7Z:
+		return pageImagesFrom7Z(provider, relPath, sorted, maxBytes)
+	case comicfmt.FormatRAR:
+		return pageImagesFromRAR(provider, relPath, sorted, maxBytes)
+	default:
+		return nil, fmt.Errorf("unsupported archive format: %s", format)
+	}
 }
 
 func probeZIP(provider mounts.Provider, relPath string, opt ProbeOptions) (ProbeResult, error) {
@@ -240,6 +262,76 @@ func pageImageFrom7Z(provider mounts.Provider, relPath string, index int, maxByt
 	return name, data, nil
 }
 
+func pageImagesFromZIP(provider mounts.Provider, relPath string, indexes []int, maxBytes int64) (map[int]PageImageData, error) {
+	archive, err := ziputil.OpenArchive(provider, relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer archive.Close()
+
+	images := ziputil.ImageFiles(archive.Reader)
+	if len(images) == 0 {
+		return nil, errors.New("zip has no image files")
+	}
+	if indexes[0] < 0 || indexes[0] >= len(images) {
+		return nil, fmt.Errorf("page index out of range")
+	}
+
+	out := make(map[int]PageImageData, len(indexes))
+	for _, idx := range indexes {
+		if idx < 0 || idx >= len(images) {
+			continue
+		}
+		page := images[idx]
+		rc, err := page.Open()
+		if err != nil {
+			return nil, err
+		}
+		buf, err := readLimited(rc, maxBytes)
+		_ = rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		out[idx] = PageImageData{Name: page.Name, Data: buf}
+	}
+	return out, nil
+}
+
+func pageImagesFrom7Z(provider mounts.Provider, relPath string, indexes []int, maxBytes int64) (map[int]PageImageData, error) {
+	var out map[int]PageImageData
+	err := with7ZReader(provider, relPath, func(r *sevenzip.ReadCloser) error {
+		images := imageFilesFrom7Z(r)
+		if len(images) == 0 {
+			return errors.New("archive has no image files")
+		}
+		if indexes[0] < 0 || indexes[0] >= len(images) {
+			return fmt.Errorf("page index out of range")
+		}
+		out = make(map[int]PageImageData, len(indexes))
+		for _, idx := range indexes {
+			if idx < 0 || idx >= len(images) {
+				continue
+			}
+			f := images[idx]
+			rc, err := f.Open()
+			if err != nil {
+				return err
+			}
+			buf, err := readLimited(rc, maxBytes)
+			_ = rc.Close()
+			if err != nil {
+				return err
+			}
+			out[idx] = PageImageData{Name: f.Name, Data: buf}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func pageImageFromRAR(provider mounts.Provider, relPath string, index int, maxBytes int64) (string, []byte, error) {
 	if index < 0 {
 		return "", nil, fmt.Errorf("page index out of range")
@@ -279,6 +371,60 @@ func pageImageFromRAR(provider mounts.Provider, relPath string, index int, maxBy
 		return "", nil, err
 	}
 	return imgName, imgData, nil
+}
+
+func pageImagesFromRAR(provider mounts.Provider, relPath string, indexes []int, maxBytes int64) (map[int]PageImageData, error) {
+	if len(indexes) == 0 {
+		return map[int]PageImageData{}, nil
+	}
+	if indexes[0] < 0 {
+		return nil, fmt.Errorf("page index out of range")
+	}
+
+	targets := make(map[int]struct{}, len(indexes))
+	maxIndex := indexes[len(indexes)-1]
+	for _, idx := range indexes {
+		if idx < 0 {
+			return nil, fmt.Errorf("page index out of range")
+		}
+		targets[idx] = struct{}{}
+	}
+
+	out := make(map[int]PageImageData, len(indexes))
+	imgIdx := 0
+	err := withRARReader(provider, relPath, func(rr *rardecode.Reader) error {
+		for {
+			h, err := rr.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if h == nil || h.IsDir || !ziputil.IsImageName(h.Name) {
+				continue
+			}
+			if imgIdx > maxIndex {
+				return nil
+			}
+			if _, ok := targets[imgIdx]; ok {
+				buf, err := readLimited(rr, maxBytes)
+				if err != nil {
+					return err
+				}
+				out[imgIdx] = PageImageData{Name: h.Name, Data: buf}
+			}
+			imgIdx++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("page index out of range")
+	}
+	return out, nil
 }
 
 func with7ZReader(provider mounts.Provider, relPath string, fn func(*sevenzip.ReadCloser) error) error {
@@ -431,6 +577,23 @@ func rankImageName(name string, idx int) int {
 	}
 	score += 1000 - idx
 	return score
+}
+
+func normalizePageIndexes(indexes []int) []int {
+	if len(indexes) == 0 {
+		return nil
+	}
+	sorted := append([]int(nil), indexes...)
+	sort.Ints(sorted)
+	out := sorted[:0]
+	prev := 0
+	for i, idx := range sorted {
+		if i == 0 || idx != prev {
+			out = append(out, idx)
+			prev = idx
+		}
+	}
+	return out
 }
 
 func buildJPEGCoverFromRaw(raw []byte, thumbWidth int) ([]byte, error) {

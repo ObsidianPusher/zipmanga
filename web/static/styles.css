@@ -622,6 +622,29 @@ body.reader-active .page-wrap {
   width: 100%;
 }
 
+.webp-convert-actions {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.webp-convert-config-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.webp-progress-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.76);
+  padding: 12px;
+}
+
+.webp-progress-track {
+  min-height: 12px;
+}
+
 .name-format-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -694,6 +717,48 @@ body.reader-active .page-wrap {
   font-size: 14px;
 }
 
+.task-summary {
+  min-height: 220px;
+}
+
+.task-summary-grid {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.task-summary-grid > div {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: #fff;
+}
+
+.task-summary-grid > div.full {
+  grid-column: 1 / -1;
+}
+
+.task-summary-grid dt {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.task-summary-grid dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.task-summary-grid .error-text {
+  color: var(--danger);
+}
+
 #archiveTaskList li {
   align-items: flex-start;
 }
@@ -724,6 +789,27 @@ body.reader-active .page-wrap {
   font-size: 13px;
   color: var(--text);
   font-weight: 600;
+}
+
+#webpConvertTaskList li {
+  align-items: flex-start;
+}
+
+#webpConvertTaskList .archive-task-item {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: #fff;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+#webpConvertTaskList .archive-task-item.active {
+  border-color: #2b78e9;
+  background: rgba(43, 120, 233, 0.1);
 }
 
 .settings-layout {
@@ -1274,11 +1360,20 @@ body.fullscreen-reading .reader-stage[data-mode="scroll"] .reader-page-error {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .webp-convert-actions,
+  .webp-convert-config-grid {
+    grid-template-columns: 1fr;
+  }
+
   .name-format-actions {
     grid-template-columns: 1fr;
   }
 
   .archive-task-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .task-summary-grid {
     grid-template-columns: 1fr;
   }
 

@@ -39,6 +39,11 @@ const (
 	RenderFormatPNG  RenderFormat = "png"
 )
 
+type RenderedPage struct {
+	Data        []byte
+	ContentType string
+}
+
 func RenderPageJPEG(provider mounts.Provider, relPath string, pageIndex int, targetWidth int) ([]byte, error) {
 	data, _, err := RenderPage(provider, relPath, pageIndex, targetWidth, RenderFormatJPEG)
 	return data, err
@@ -99,6 +104,66 @@ func RenderPage(provider mounts.Provider, relPath string, pageIndex int, targetW
 	return nil, "", firstErr
 }
 
+func RenderPages(provider mounts.Provider, relPath string, startPageIndex, endPageIndex int, targetWidth int, format RenderFormat) (map[int]RenderedPage, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("provider is nil")
+	}
+	if startPageIndex < 0 || endPageIndex < startPageIndex {
+		return nil, fmt.Errorf("invalid page range")
+	}
+	if format != RenderFormatPNG {
+		format = RenderFormatJPEG
+	}
+
+	toolPath, toolName, err := lookupPDFRenderTool()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := acquireRenderSlot(); err != nil {
+		return nil, err
+	}
+	defer releaseRenderSlot()
+
+	inputFile, cleanup, err := materializePDF(provider, relPath)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	workDir, err := os.MkdirTemp("", "zipmanga-pdf-render-*")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(workDir) }()
+
+	outPrefix := filepath.Join(workDir, "page")
+	startPageNum := startPageIndex + 1
+	endPageNum := endPageIndex + 1
+
+	attempts := buildRenderAttempts(targetWidth)
+	var firstErr error
+	for _, attempt := range attempts {
+		pages, renderErr := renderPagesWithTool(toolPath, toolName, inputFile, outPrefix, startPageNum, endPageNum, attempt, format)
+		if renderErr == nil {
+			out := make(map[int]RenderedPage, len(pages))
+			for pageNum, page := range pages {
+				out[pageNum-1] = page
+			}
+			return out, nil
+		}
+		if firstErr == nil {
+			firstErr = renderErr
+		} else {
+			firstErr = fmt.Errorf("%v; retry failed: %w", firstErr, renderErr)
+		}
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("unknown render error")
+	}
+	return nil, firstErr
+}
+
 func renderPageWithTool(toolPath, toolName, inputFile, outPrefix string, pageNum int, attempt renderAttempt, format RenderFormat) ([]byte, string, error) {
 	args := []string{
 		"-f", strconv.Itoa(pageNum),
@@ -146,6 +211,67 @@ func renderPageWithTool(toolPath, toolName, inputFile, outPrefix string, pageNum
 		return nil, "", fmt.Errorf("rendered page is empty")
 	}
 	return data, contentType, nil
+}
+
+func renderPagesWithTool(toolPath, toolName, inputFile, outPrefix string, startPageNum, endPageNum int, attempt renderAttempt, format RenderFormat) (map[int]RenderedPage, error) {
+	args := []string{
+		"-f", strconv.Itoa(startPageNum),
+		"-l", strconv.Itoa(endPageNum),
+	}
+	outExt := ".jpg"
+	contentType := "image/jpeg"
+	switch format {
+	case RenderFormatPNG:
+		args = append(args, "-png")
+		outExt = ".png"
+		contentType = "image/png"
+	default:
+		args = append(args, "-jpeg")
+		if toolName == "pdftoppm" {
+			args = append(args, "-jpegopt", "quality=93,optimize=y")
+		}
+	}
+	if attempt.width > 0 {
+		args = append(args, "-scale-to-x", strconv.Itoa(attempt.width), "-scale-to-y", "-1")
+	}
+	args = append(args, inputFile, outPrefix)
+
+	pageCount := endPageNum - startPageNum + 1
+	timeout := attempt.timeout
+	if pageCount > 1 {
+		timeout += time.Duration(pageCount-1) * 12 * time.Second
+		if timeout > 4*time.Minute {
+			timeout = 4 * time.Minute
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, toolPath, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := stderr.String()
+		if msg == "" {
+			msg = err.Error()
+		}
+		return nil, fmt.Errorf("%s batch render failed (%d-%d w=%d timeout=%s): %s", toolName, startPageNum, endPageNum, attempt.width, timeout, strings.TrimSpace(msg))
+	}
+
+	out := make(map[int]RenderedPage, pageCount)
+	for pageNum := startPageNum; pageNum <= endPageNum; pageNum++ {
+		outPath := fmt.Sprintf("%s-%d%s", outPrefix, pageNum, outExt)
+		data, err := os.ReadFile(outPath)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("rendered page is empty")
+		}
+		out[pageNum] = RenderedPage{Data: data, ContentType: contentType}
+	}
+	return out, nil
 }
 
 func lookupPDFRenderTool() (string, string, error) {

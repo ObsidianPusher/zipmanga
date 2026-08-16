@@ -22,6 +22,7 @@ type CoverCache struct {
 	mu       sync.Mutex
 	inflight map[string]*coverBuildCall
 	buildSem chan struct{}
+	touchCh  chan cacheTouchRequest
 }
 
 type coverBuildCall struct {
@@ -43,14 +44,17 @@ func NewCoverCache(store *db.Store, baseDir string, maxEntries int64) (*CoverCac
 	if err := os.MkdirAll(coverDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create cover cache dir: %w", err)
 	}
-	return &CoverCache{
+	cache := &CoverCache{
 		store:      store,
 		baseDir:    baseDir,
 		coverDir:   coverDir,
 		maxEntries: maxEntries,
 		inflight:   make(map[string]*coverBuildCall, 128),
 		buildSem:   make(chan struct{}, 2),
-	}, nil
+		touchCh:    make(chan cacheTouchRequest, 512),
+	}
+	go cache.runTouchWorker()
+	return cache, nil
 }
 
 func (c *CoverCache) Ensure(key string, build func() ([]byte, error)) (string, error) {
@@ -171,7 +175,9 @@ func (c *CoverCache) getPathIfExistsNoLock(key string) (string, bool, error) {
 	}
 
 	now := time.Now().Unix()
-	_ = c.store.TouchCacheEntry(key, now)
+	if now-e.LastAccess >= cacheTouchMinInterval {
+		c.enqueueTouch(key, now)
+	}
 	return absPath, true, nil
 }
 
@@ -182,7 +188,7 @@ func (c *CoverCache) Reap() error {
 }
 
 func (c *CoverCache) reapNoLock() error {
-	total, err := c.store.TotalCacheEntries()
+	total, err := c.store.TotalCacheEntriesByRelPathPrefix("covers/")
 	if err != nil {
 		return err
 	}
@@ -195,7 +201,7 @@ func (c *CoverCache) reapNoLock() error {
 		if batch < 32 {
 			batch = 32
 		}
-		oldest, err := c.store.ListOldestCacheEntries(batch)
+		oldest, err := c.store.ListOldestCacheEntriesByRelPathPrefix("covers/", batch)
 		if err != nil {
 			return err
 		}
@@ -229,6 +235,28 @@ func (c *CoverCache) writeCover(key string, data []byte, ext string) (absPath st
 		return "", "", err
 	}
 	return absPath, filepath.ToSlash(relPath), nil
+}
+
+func (c *CoverCache) enqueueTouch(key string, nowUnix int64) {
+	if key == "" || nowUnix <= 0 || c.touchCh == nil {
+		return
+	}
+	select {
+	case c.touchCh <- cacheTouchRequest{key: key, nowUnix: nowUnix}:
+	default:
+	}
+}
+
+func (c *CoverCache) runTouchWorker() {
+	if c.touchCh == nil {
+		return
+	}
+	for req := range c.touchCh {
+		if req.key == "" || req.nowUnix <= 0 {
+			continue
+		}
+		_ = c.store.TouchCacheEntry(req.key, req.nowUnix)
+	}
 }
 
 func normalizeCacheExt(ext string) string {

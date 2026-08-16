@@ -5,6 +5,7 @@ go 1.22
 require (
 	github.com/bodgit/sevenzip v1.6.1
 	github.com/hirochachacha/go-smb2 v1.1.0
+	github.com/linzeyan/webp-go v0.1.0
 	github.com/nwaples/rardecode v1.1.3
 	github.com/studio-b12/gowebdav v0.10.0
 	golang.org/x/crypto v0.30.0
@@ -38,3 +39,5 @@ require (
 	modernc.org/strutil v1.2.0 // indirect
 	modernc.org/token v1.1.0 // indirect
 )
+
+replace github.com/linzeyan/webp-go => ./third_party/linzeyan-webp-go

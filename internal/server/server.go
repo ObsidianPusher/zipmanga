@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -29,6 +30,7 @@ import (
 	"zipmanga/internal/comicutil"
 	"zipmanga/internal/config"
 	"zipmanga/internal/db"
+	"zipmanga/internal/imgcodec"
 	"zipmanga/internal/imgenhance"
 	"zipmanga/internal/mounts"
 	"zipmanga/internal/pdfutil"
@@ -51,6 +53,7 @@ type Server struct {
 	mountManager *mounts.Manager
 	scanner      *scanner.Service
 	coverCache   *cache.CoverCache
+	pageCache    *cache.PageCache
 	logger       *log.Logger
 
 	sessionTTL time.Duration
@@ -70,12 +73,18 @@ type Server struct {
 	pageCountWarmMu   sync.Mutex
 	pageCountInFlight map[int64]struct{}
 	pageCountWarmSem  chan struct{}
+	pageLoadMu        sync.Mutex
+	pageLoadQueues    map[string]*comicPageLoadQueue
+	pageLoadSem       chan struct{}
 
 	archiveTaskMu    sync.RWMutex
 	archiveTasks     map[string]*archiveWorkflowTask
 	archiveTaskOrder []string
 	archiveTaskSeq   uint64
 	archiveTaskLimit int
+
+	webpTaskMu   sync.Mutex
+	webpTaskRuns map[string]*webpTaskRun
 
 	nameFormatMu       sync.RWMutex
 	nameFormatPreviews map[string]*nameFormatPreview
@@ -90,6 +99,7 @@ type Dependencies struct {
 	MountManager *mounts.Manager
 	Scanner      *scanner.Service
 	CoverCache   *cache.CoverCache
+	PageCache    *cache.PageCache
 	Logger       *log.Logger
 	WebDir       string
 }
@@ -114,6 +124,7 @@ func New(deps Dependencies) (*Server, error) {
 		mountManager:       deps.MountManager,
 		scanner:            deps.Scanner,
 		coverCache:         deps.CoverCache,
+		pageCache:          deps.PageCache,
 		logger:             deps.Logger,
 		sessionTTL:         sessionTTL,
 		staticFS:           staticFS,
@@ -126,13 +137,17 @@ func New(deps Dependencies) (*Server, error) {
 		pageEnhanceSem:     make(chan struct{}, 1),
 		pageCountInFlight:  make(map[int64]struct{}, 256),
 		pageCountWarmSem:   make(chan struct{}, 1),
+		pageLoadQueues:     make(map[string]*comicPageLoadQueue, 128),
+		pageLoadSem:        make(chan struct{}, 2),
 		archiveTasks:       make(map[string]*archiveWorkflowTask, 64),
 		archiveTaskOrder:   make([]string, 0, 64),
 		archiveTaskLimit:   120,
+		webpTaskRuns:       make(map[string]*webpTaskRun, 16),
 		nameFormatPreviews: make(map[string]*nameFormatPreview, 32),
 		nameFormatLimit:    64,
 	}
 	s.registerRoutes()
+	s.recoverWebPTasks()
 	return s, nil
 }
 
@@ -163,11 +178,13 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /api/mounts", s.authRequired(s.handleAPIListMounts))
 	s.router.HandleFunc("POST /api/mounts", s.authRequired(s.adminOnly(s.handleAPICreateMount)))
 	s.router.HandleFunc("POST /api/mounts/browse", s.authRequired(s.adminOnly(s.handleAPIBrowseMountDirs)))
+	s.router.HandleFunc("POST /api/admin/mounts/{id}/browse", s.authRequired(s.adminOnly(s.handleAPIAdminBrowseStoredMountDirs)))
 	s.router.HandleFunc("PUT /api/mounts/{id}", s.authRequired(s.adminOnly(s.handleAPIUpdateMount)))
 	s.router.HandleFunc("DELETE /api/mounts/{id}", s.authRequired(s.adminOnly(s.handleAPIDeleteMount)))
 	s.router.HandleFunc("GET /api/root-directories", s.authRequired(s.adminOnly(s.handleAPIListRootDirectories)))
 	s.router.HandleFunc("POST /api/root-directories", s.authRequired(s.adminOnly(s.handleAPICreateRootDirectory)))
 	s.router.HandleFunc("DELETE /api/root-directories/{id}", s.authRequired(s.adminOnly(s.handleAPIDeleteRootDirectory)))
+	s.router.HandleFunc("POST /api/admin/root-directories/{id}/browse", s.authRequired(s.adminOnly(s.handleAPIAdminBrowseRootDirectoryDirs)))
 
 	s.router.HandleFunc("POST /api/scan", s.authRequired(s.adminOnly(s.handleAPIScanAll)))
 	s.router.HandleFunc("GET /api/scan/status", s.authRequired(s.adminOnly(s.handleAPIScanStatus)))
@@ -188,6 +205,10 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("PUT /api/admin/users/{id}/password", s.authRequired(s.adminOnly(s.handleAPIUpdateUserPassword)))
 	s.router.HandleFunc("GET /api/admin/runtime", s.authRequired(s.adminOnly(s.handleAPIGetRuntimeSettings)))
 	s.router.HandleFunc("PUT /api/admin/runtime", s.authRequired(s.adminOnly(s.handleAPIUpdateRuntimeSettings)))
+	s.router.HandleFunc("GET /api/admin/webp/tasks", s.authRequired(s.adminOnly(s.handleAPIAdminListWebPTasks)))
+	s.router.HandleFunc("POST /api/admin/webp/tasks", s.authRequired(s.adminOnly(s.handleAPIAdminCreateWebPTask)))
+	s.router.HandleFunc("GET /api/admin/webp/tasks/{id}", s.authRequired(s.adminOnly(s.handleAPIAdminGetWebPTask)))
+	s.router.HandleFunc("POST /api/admin/webp/tasks/{id}/cancel", s.authRequired(s.adminOnly(s.handleAPIAdminCancelWebPTask)))
 	s.router.HandleFunc("GET /api/admin/archive-workflow/tasks", s.authRequired(s.adminOnly(s.handleAPIAdminArchiveWorkflowListTasks)))
 	s.router.HandleFunc("POST /api/admin/archive-workflow/tasks", s.authRequired(s.adminOnly(s.handleAPIAdminArchiveWorkflowCreateTask)))
 	s.router.HandleFunc("GET /api/admin/archive-workflow/tasks/{id}", s.authRequired(s.adminOnly(s.handleAPIAdminArchiveWorkflowGetTask)))
@@ -568,7 +589,14 @@ func (s *Server) handleAPIGetRuntimeSettings(w http.ResponseWriter, _ *http.Requ
 
 func (s *Server) handleAPIUpdateRuntimeSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MemoryLimitMB int64 `json:"memory_limit_mb"`
+		MemoryLimitMB       *int64  `json:"memory_limit_mb"`
+		DiskCacheMB         *int64  `json:"disk_cache_mb"`
+		PagePrefetchPages   *int64  `json:"page_prefetch_pages"`
+		PageLoadParallelism *int64  `json:"page_load_parallelism"`
+		WebPQuality         *int64  `json:"webp_quality"`
+		WebPMethod          *int64  `json:"webp_method"`
+		WebPConcurrency     *int64  `json:"webp_concurrency"`
+		WebPOutputRoot      *string `json:"webp_output_root"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -577,8 +605,29 @@ func (s *Server) handleAPIUpdateRuntimeSettings(w http.ResponseWriter, r *http.R
 
 	current := s.currentRuntimeConfig()
 	next := current
-	if req.MemoryLimitMB > 0 {
-		next.MemoryLimitMB = req.MemoryLimitMB
+	if req.MemoryLimitMB != nil {
+		next.MemoryLimitMB = *req.MemoryLimitMB
+	}
+	if req.DiskCacheMB != nil {
+		next.DiskCacheMB = *req.DiskCacheMB
+	}
+	if req.PagePrefetchPages != nil {
+		next.PagePrefetchPages = *req.PagePrefetchPages
+	}
+	if req.PageLoadParallelism != nil {
+		next.PageLoadParallelism = *req.PageLoadParallelism
+	}
+	if req.WebPQuality != nil {
+		next.WebPQuality = *req.WebPQuality
+	}
+	if req.WebPMethod != nil {
+		next.WebPMethod = *req.WebPMethod
+	}
+	if req.WebPConcurrency != nil {
+		next.WebPConcurrency = *req.WebPConcurrency
+	}
+	if req.WebPOutputRoot != nil {
+		next.WebPOutputRoot = strings.TrimSpace(*req.WebPOutputRoot)
 	}
 	next = normalizeRuntimeConfig(next)
 	if err := validateRuntimeConfig(next); err != nil {
@@ -691,6 +740,102 @@ func (s *Server) handleAPIBrowseMountDirs(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"current_path": currentPath,
+		"items":        dirs,
+	})
+}
+
+func (s *Server) handleAPIAdminBrowseStoredMountDirs(w http.ResponseWriter, r *http.Request) {
+	id, err := parsePathInt64(r, "id")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid mount id"})
+		return
+	}
+	mount, err := s.store.GetMount(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "mount not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if mount.Type != db.MountTypeLocal {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "only local mounts support folder browsing"})
+		return
+	}
+
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	currentPath := strings.TrimSpace(req.Path)
+	if currentPath == "" {
+		type dirItem struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		}
+		roots := make([]dirItem, 0, len(mount.RootPaths))
+		for _, root := range uniqueStrings(mount.RootPaths) {
+			if strings.TrimSpace(root) == "" {
+				continue
+			}
+			roots = append(roots, dirItem{
+				Name: filepath.Base(root),
+				Path: root,
+			})
+		}
+		sort.Slice(roots, func(i, j int) bool {
+			return strings.ToLower(roots[i].Path) < strings.ToLower(roots[j].Path)
+		})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"current_path": "",
+			"items":        roots,
+		})
+		return
+	}
+
+	fullPath, err := validateStoredMountBrowsePath(mount, currentPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	entries, err := os.ReadDir(fullPath)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	type dirItem struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+	dirs := make([]dirItem, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		item := mounts.FileEntry{Name: entry.Name()}
+		if mounts.ShouldHideEntry(item) {
+			continue
+		}
+		dirs = append(dirs, dirItem{
+			Name: entry.Name(),
+			Path: filepath.Join(fullPath, entry.Name()),
+		})
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name)
+	})
+	if len(dirs) > 2000 {
+		dirs = dirs[:2000]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"current_path": fullPath,
 		"items":        dirs,
 	})
 }
@@ -958,7 +1103,8 @@ func (s *Server) handleAPIGetProgress(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid comic id"})
 		return
 	}
-	p, err := s.store.GetReadingProgress(u.ID, comicID)
+	fileNameKey := strings.TrimSpace(r.URL.Query().Get("comic_file_name_key"))
+	p, err := s.store.GetReadingProgressForComic(u.ID, comicID, fileNameKey)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeJSON(w, http.StatusOK, map[string]any{"progress": nil})
@@ -1011,6 +1157,10 @@ func (s *Server) handleAPIUpdateProgress(w http.ResponseWriter, r *http.Request)
 	}
 	p, err := s.store.UpsertReadingProgress(u.ID, comicID, req.ComicFileNameKey, req.LastPage, req.TotalPages)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "comic not found"})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -1190,6 +1340,8 @@ func (s *Server) tryServeRawArchiveCover(w http.ResponseWriter, _ *http.Request,
 	return true
 }
 
+const pdfRawPageRenderWidth = 1920
+
 func (s *Server) handleAPIComicPage(w http.ResponseWriter, r *http.Request) {
 	id, err := parsePathInt64(r, "id")
 	if err != nil {
@@ -1221,7 +1373,6 @@ func (s *Server) handleAPIComicPage(w http.ResponseWriter, r *http.Request) {
 	enhanceMode := normalizeEnhanceMode(r.URL.Query().Get("enhance"))
 	targetWidth := parseBoundedInt(strings.TrimSpace(r.URL.Query().Get("w")), 0, 0, 7000)
 
-	// PDF 必须由后端渲染分页图（不再依赖浏览器侧渲染）。
 	if format == comicfmt.FormatPDF {
 		if comic.PageCount <= 0 {
 			s.warmPageCountAsync(comic, provider, format)
@@ -1230,87 +1381,40 @@ func (s *Server) handleAPIComicPage(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "page not found"})
 			return
 		}
-		if enhanceMode == "off" {
-			cacheKey := fmt.Sprintf("page:pdf:direct:v5:%d:%d:%d:%d:%d",
-				comic.ID, pageIdx, comic.MtimeUnix, comic.Size, targetWidth)
-			path, err := s.coverCache.Ensure(cacheKey, func() ([]byte, error) {
-				return s.withPageEnhanceSlot(func() ([]byte, error) {
-					raw, _, err := pdfutil.RenderPage(provider, comic.Path, pageIdx, targetWidth, pdfutil.RenderFormatJPEG)
-					return raw, err
-				})
-			})
-			if err != nil {
-				if s.logger != nil {
-					s.logger.Printf("warning: render pdf page failed comic=%d page=%d mode=%s: %v", comic.ID, pageIdx, enhanceMode, err)
-				}
-				s.servePageFallbackImage(w, comic.Title)
-				return
+		rawPath, rawErr := s.ensureRawComicPageCache(comic, provider, format, pageIdx)
+		if rawErr != nil {
+			if s.logger != nil {
+				s.logger.Printf("warning: load pdf raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, rawErr)
 			}
-			w.Header().Set("Content-Type", mime.TypeByExtension(strings.ToLower(filepath.Ext(path))))
-			if w.Header().Get("Content-Type") == "" {
-				w.Header().Set("Content-Type", "image/jpeg")
-			}
-			w.Header().Set("Cache-Control", "private, max-age=43200")
-			http.ServeFile(w, r, path)
+			s.servePageFallbackImage(w, comic.Title)
 			return
 		}
-
-		pdfRenderWidth := pdfRenderWidthForMode(enhanceMode, targetWidth)
-		cacheKey := fmt.Sprintf("page:pdf:v5:%d:%d:%d:%d:%s:%d:%d",
-			comic.ID, pageIdx, comic.MtimeUnix, comic.Size, enhanceMode, targetWidth, pdfRenderWidth)
-		path, err := s.coverCache.EnsureObject(cacheKey, func() (cache.CacheObject, error) {
-			return s.withPageEnhanceObjectSlot(func() (cache.CacheObject, error) {
-				raw, _, err := pdfutil.RenderPage(provider, comic.Path, pageIdx, pdfRenderWidth, pdfRenderFormatForMode(enhanceMode))
-				if err != nil {
-					return cache.CacheObject{}, err
-				}
-				enhanced, contentType, err := imgenhance.Enhance(raw, "page.jpg", imgenhance.Options{
-					Mode:        imgenhance.Mode(enhanceMode),
-					TargetWidth: targetWidth,
-					Source:      imgenhance.SourcePDF,
-				})
-				if err != nil {
-					return cache.CacheObject{}, err
-				}
-				return cache.CacheObject{
-					Data: enhanced,
-					Ext:  cacheExtForContentType(contentType),
-				}, nil
-			})
+		go s.prefetchComicPages(comic, provider, format, pageIdx)
+		if enhanceMode == "off" {
+			s.serveCachedPageFile(w, r, rawPath, "image/jpeg")
+			return
+		}
+		raw, readErr := os.ReadFile(rawPath)
+		if readErr != nil {
+			if s.logger != nil {
+				s.logger.Printf("warning: read pdf raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, readErr)
+			}
+			s.servePageFallbackImage(w, comic.Title)
+			return
+		}
+		enhanced, contentType, err := imgenhance.Enhance(raw, rawPath, imgenhance.Options{
+			Mode:        imgenhance.Mode(enhanceMode),
+			TargetWidth: targetWidth,
+			Source:      imgenhance.SourcePDF,
 		})
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Printf("warning: enhance pdf page failed comic=%d page=%d mode=%s: %v", comic.ID, pageIdx, enhanceMode, err)
 			}
-			rawKey := fmt.Sprintf("page:pdf:raw:v5:%d:%d:%d:%d:%s:%d",
-				comic.ID, pageIdx, comic.MtimeUnix, comic.Size, enhanceMode, targetWidth)
-			rawPath, rawErr := s.coverCache.Ensure(rawKey, func() ([]byte, error) {
-				return s.withPageEnhanceSlot(func() ([]byte, error) {
-					raw, _, err := pdfutil.RenderPage(provider, comic.Path, pageIdx, targetWidth, pdfutil.RenderFormatJPEG)
-					return raw, err
-				})
-			})
-			if rawErr == nil {
-				w.Header().Set("Content-Type", mime.TypeByExtension(strings.ToLower(filepath.Ext(rawPath))))
-				if w.Header().Get("Content-Type") == "" {
-					w.Header().Set("Content-Type", "image/jpeg")
-				}
-				w.Header().Set("Cache-Control", "private, max-age=600")
-				http.ServeFile(w, r, rawPath)
-				return
-			}
-			if s.logger != nil {
-				s.logger.Printf("warning: render pdf raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, rawErr)
-			}
-			s.servePageFallbackImage(w, comic.Title)
+			s.serveCachedPageFile(w, r, rawPath, "image/jpeg")
 			return
 		}
-		w.Header().Set("Content-Type", mime.TypeByExtension(strings.ToLower(filepath.Ext(path))))
-		if w.Header().Get("Content-Type") == "" {
-			w.Header().Set("Content-Type", "image/jpeg")
-		}
-		w.Header().Set("Cache-Control", "private, max-age=43200")
-		http.ServeFile(w, r, path)
+		s.serveInlineImage(w, enhanced, contentType)
 		return
 	}
 
@@ -1323,76 +1427,278 @@ func (s *Server) handleAPIComicPage(w http.ResponseWriter, r *http.Request) {
 		s.warmPageCountAsync(warmComic, provider, format)
 	}
 
-	pageName, raw, err := archiveutil.PageImage(provider, comic.Path, format, pageIdx, 64<<20)
-	if err != nil {
+	rawPath, rawErr := s.ensureRawComicPageCache(comic, provider, format, pageIdx)
+	if rawErr != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "page not found"})
 		return
 	}
-	if len(raw) == 0 {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "page image is empty"})
+	go s.prefetchComicPages(comic, provider, format, pageIdx)
+	if enhanceMode == "off" {
+		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
 		return
 	}
-	if targetWidth > 0 {
-		cacheKey := fmt.Sprintf("page:zip:display:v5:%d:%d:%d:%d:%s:%d",
-			comic.ID, pageIdx, comic.MtimeUnix, comic.Size, enhanceMode, targetWidth)
-		path, resizeErr := s.coverCache.EnsureObject(cacheKey, func() (cache.CacheObject, error) {
-			resized, contentType, err := imgenhance.RenderForDisplay(raw, pageName, imgenhance.Options{
-				Mode:        imgenhance.Mode(enhanceMode),
-				TargetWidth: targetWidth,
-				Source:      imgenhance.SourceImage,
-			})
+
+	raw, readErr := os.ReadFile(rawPath)
+	if readErr != nil {
+		if s.logger != nil {
+			s.logger.Printf("warning: read archive raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, readErr)
+		}
+		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
+		return
+	}
+	resized, contentType, err := imgenhance.RenderForDisplay(raw, rawPath, imgenhance.Options{
+		Mode:        imgenhance.Mode(enhanceMode),
+		TargetWidth: targetWidth,
+		Source:      imgenhance.SourceImage,
+	})
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Printf("warning: render archive display page failed comic=%d page=%d mode=%s target_width=%d: %v", comic.ID, pageIdx, enhanceMode, targetWidth, err)
+		}
+		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
+		return
+	}
+	s.serveInlineImage(w, resized, contentType)
+}
+
+func (s *Server) ensureRawComicPageCache(comic db.Comic, provider mounts.Provider, format comicfmt.Format, pageIdx int) (string, error) {
+	if s.pageCache == nil {
+		return "", errors.New("page cache is unavailable")
+	}
+	key := rawComicPageCacheKey(comic, format, pageIdx)
+	if path, ok, err := s.pageCache.GetPathIfExists(key); err != nil {
+		return "", err
+	} else if ok {
+		return path, nil
+	}
+
+	waiter := s.enqueueComicPageLoad(comic, provider, format, pageIdx, true)
+	result, ok := <-waiter
+	if !ok {
+		return "", errors.New("page cache load task ended unexpectedly")
+	}
+	return result.path, result.err
+}
+
+func (s *Server) loadRawComicPageCacheDirect(comic db.Comic, provider mounts.Provider, format comicfmt.Format, pageIdx int) (string, error) {
+	if s.pageCache == nil {
+		return "", errors.New("page cache is unavailable")
+	}
+
+	key := rawComicPageCacheKey(comic, format, pageIdx)
+	if path, ok, err := s.pageCache.GetPathIfExists(key); err != nil {
+		return "", err
+	} else if ok {
+		return path, nil
+	}
+
+	obj, err := s.buildRawComicPageCacheObject(comic, provider, format, pageIdx)
+	if err != nil {
+		return "", err
+	}
+	return s.pageCache.StoreObject(key, obj)
+}
+
+func (s *Server) buildRawComicPageCacheObject(comic db.Comic, provider mounts.Provider, format comicfmt.Format, pageIdx int) (cache.CacheObject, error) {
+	switch format {
+	case comicfmt.FormatPDF:
+		return s.withPageEnhanceObjectSlot(func() (cache.CacheObject, error) {
+			raw, _, err := pdfutil.RenderPage(provider, comic.Path, pageIdx, pdfRawPageRenderWidth, pdfutil.RenderFormatJPEG)
 			if err != nil {
 				return cache.CacheObject{}, err
 			}
-			return cache.CacheObject{
-				Data: resized,
-				Ext:  cacheExtForContentType(contentType),
-			}, nil
-		})
-		if resizeErr == nil {
-			w.Header().Set("Content-Type", mime.TypeByExtension(strings.ToLower(filepath.Ext(path))))
-			if w.Header().Get("Content-Type") == "" {
-				w.Header().Set("Content-Type", archiveutil.GuessImageContentType(pageName))
+			if len(raw) == 0 {
+				return cache.CacheObject{}, errors.New("rendered page is empty")
 			}
-			w.Header().Set("Cache-Control", "private, max-age=43200")
-			http.ServeFile(w, r, path)
-			return
-		}
-		if s.logger != nil {
-			s.logger.Printf("warning: render archive display page failed comic=%d page=%d mode=%s target_width=%d: %v", comic.ID, pageIdx, enhanceMode, targetWidth, resizeErr)
-		}
-	}
-
-	w.Header().Set("Content-Type", archiveutil.GuessImageContentType(pageName))
-	w.Header().Set("Cache-Control", "private, max-age=600")
-	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
-	_, _ = w.Write(raw)
-}
-
-func pdfRenderWidthForMode(mode string, targetWidth int) int {
-	if targetWidth <= 0 {
-		return 0
-	}
-	base := targetWidth
-	switch normalizeEnhanceMode(mode) {
-	case "level2":
-		base = int(float64(base) * 1.12)
-	case "level1":
-		base = int(float64(base) * 1.05)
+			return s.buildLossyRawPageCacheObject(comic.ID, pageIdx, "pdf", raw, ".jpg"), nil
+		})
 	default:
-		base = targetWidth
+		pageName, raw, err := archiveutil.PageImage(provider, comic.Path, format, pageIdx, 64<<20)
+		if err != nil {
+			return cache.CacheObject{}, err
+		}
+		if len(raw) == 0 {
+			return cache.CacheObject{}, errors.New("page image is empty")
+		}
+		ext := filepath.Ext(pageName)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		return s.withPageEnhanceObjectSlot(func() (cache.CacheObject, error) {
+			return s.buildLossyRawPageCacheObject(comic.ID, pageIdx, pageName, raw, ext), nil
+		})
 	}
-	if base <= 0 {
-		return 0
-	}
-	return parseBoundedInt(strconv.Itoa(base), 0, 1, 7000)
 }
 
-func pdfRenderFormatForMode(mode string) pdfutil.RenderFormat {
-	if normalizeEnhanceMode(mode) == "level2" {
-		return pdfutil.RenderFormatPNG
+func rawComicPageCacheKey(comic db.Comic, format comicfmt.Format, pageIdx int) string {
+	if format == comicfmt.FormatPDF {
+		return fmt.Sprintf("page:raw:v5:pdf:%d:%d:%d:%d:%d:q%d", comic.ID, pageIdx, comic.MtimeUnix, comic.Size, pdfRawPageRenderWidth, int(imgcodec.LossyWebPQuality))
 	}
-	return pdfutil.RenderFormatJPEG
+	return fmt.Sprintf("page:raw:v5:%s:%d:%d:%d:%d:q%d", format, comic.ID, pageIdx, comic.MtimeUnix, comic.Size, int(imgcodec.LossyWebPQuality))
+}
+
+func (s *Server) prefetchComicPages(comic db.Comic, provider mounts.Provider, format comicfmt.Format, pageIdx int) {
+	if s.pageCache == nil || provider == nil {
+		return
+	}
+	prefetch := int(s.currentRuntimeConfig().PagePrefetchPages)
+	if prefetch <= 0 {
+		return
+	}
+	start := pageIdx + 1
+	end := pageIdx + prefetch
+	if comic.PageCount > 0 && end >= comic.PageCount {
+		end = comic.PageCount - 1
+	}
+	if end < start {
+		return
+	}
+	missing := s.collectMissingRawComicPageIndexes(comic, format, start, end)
+	if len(missing) == 0 {
+		return
+	}
+	for _, idx := range missing {
+		s.enqueueComicPageLoad(comic, provider, format, idx, false)
+	}
+}
+
+func (s *Server) collectMissingRawComicPageIndexes(comic db.Comic, format comicfmt.Format, start, end int) []int {
+	if s.pageCache == nil || end < start {
+		return nil
+	}
+	missing := make([]int, 0, end-start+1)
+	for i := start; i <= end; i++ {
+		key := rawComicPageCacheKey(comic, format, i)
+		if _, ok, err := s.pageCache.GetPathIfExists(key); err == nil && ok {
+			continue
+		}
+		missing = append(missing, i)
+	}
+	return missing
+}
+
+func (s *Server) prefetchArchiveComicPages(comic db.Comic, provider mounts.Provider, format comicfmt.Format, missing []int) {
+	if s.pageCache == nil || !comicfmt.IsArchive(format) || len(missing) == 0 {
+		return
+	}
+
+	pages, err := archiveutil.PageImages(provider, comic.Path, format, missing, 64<<20)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Printf("warning: batch prefetch archive pages failed comic=%d start=%d end=%d: %v", comic.ID, missing[0], missing[len(missing)-1], err)
+		}
+		s.prefetchRawComicPagesFallback(comic, provider, format, missing)
+		return
+	}
+
+	s.storePrefetchedRawComicPages(comic, format, missing, func(idx int) (cache.CacheObject, bool) {
+		page, ok := pages[idx]
+		if !ok || len(page.Data) == 0 {
+			return cache.CacheObject{}, false
+		}
+		ext := filepath.Ext(page.Name)
+		if ext == "" {
+			ext = ".jpg"
+		}
+		return s.buildLossyRawPageCacheObject(comic.ID, idx, page.Name, page.Data, ext), true
+	})
+}
+
+func (s *Server) prefetchPDFComicPages(comic db.Comic, provider mounts.Provider, missing []int) {
+	if s.pageCache == nil || len(missing) == 0 {
+		return
+	}
+
+	pages, err := pdfutil.RenderPages(provider, comic.Path, missing[0], missing[len(missing)-1], pdfRawPageRenderWidth, pdfutil.RenderFormatJPEG)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Printf("warning: batch prefetch pdf pages failed comic=%d start=%d end=%d: %v", comic.ID, missing[0], missing[len(missing)-1], err)
+		}
+		s.prefetchRawComicPagesFallback(comic, provider, comicfmt.FormatPDF, missing)
+		return
+	}
+
+	s.storePrefetchedRawComicPages(comic, comicfmt.FormatPDF, missing, func(idx int) (cache.CacheObject, bool) {
+		page, ok := pages[idx]
+		if !ok || len(page.Data) == 0 {
+			return cache.CacheObject{}, false
+		}
+		return s.buildLossyRawPageCacheObject(comic.ID, idx, "pdf", page.Data, cacheExtForContentType(page.ContentType)), true
+	})
+}
+
+func (s *Server) buildLossyRawPageCacheObject(comicID int64, pageIdx int, pageName string, raw []byte, fallbackExt string) cache.CacheObject {
+	if strings.EqualFold(strings.TrimSpace(fallbackExt), imgcodec.LossyWebPExt) {
+		return cache.CacheObject{Data: raw, Ext: imgcodec.LossyWebPExt}
+	}
+	webp, err := imgcodec.EncodeLossyWebP(raw)
+	if err == nil {
+		return cache.CacheObject{Data: webp, Ext: imgcodec.LossyWebPExt}
+	}
+	if s.logger != nil {
+		s.logger.Printf("warning: encode raw page to lossy webp failed comic=%d page=%d name=%s: %v", comicID, pageIdx, pageName, err)
+	}
+	if fallbackExt == "" {
+		fallbackExt = ".jpg"
+	}
+	return cache.CacheObject{Data: raw, Ext: fallbackExt}
+}
+
+func (s *Server) storePrefetchedRawComicPages(comic db.Comic, format comicfmt.Format, indexes []int, build func(idx int) (cache.CacheObject, bool)) {
+	if s.pageCache == nil || len(indexes) == 0 || build == nil {
+		return
+	}
+	for _, idx := range indexes {
+		obj, ok := build(idx)
+		if !ok || len(obj.Data) == 0 {
+			if s.logger != nil {
+				s.logger.Printf("warning: prefetched page payload missing comic=%d page=%d", comic.ID, idx)
+			}
+			continue
+		}
+		key := rawComicPageCacheKey(comic, format, idx)
+		objCopy := obj
+		if _, ensureErr := s.pageCache.EnsureObject(key, func() (cache.CacheObject, error) {
+			return objCopy, nil
+		}); ensureErr != nil && s.logger != nil {
+			s.logger.Printf("warning: store prefetched page failed comic=%d page=%d: %v", comic.ID, idx, ensureErr)
+		}
+	}
+}
+
+func (s *Server) prefetchRawComicPagesFallback(comic db.Comic, provider mounts.Provider, format comicfmt.Format, indexes []int) {
+	for _, idx := range indexes {
+		if _, err := s.ensureRawComicPageCache(comic, provider, format, idx); err != nil && s.logger != nil {
+			s.logger.Printf("warning: prefetch page failed comic=%d page=%d: %v", comic.ID, idx, err)
+		}
+	}
+}
+
+func (s *Server) serveCachedPageFile(w http.ResponseWriter, r *http.Request, path string, fallbackContentType string) {
+	contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(path)))
+	if contentType == "" {
+		contentType = fallbackContentType
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=43200")
+	http.ServeFile(w, r, path)
+}
+
+func (s *Server) serveInlineImage(w http.ResponseWriter, data []byte, contentType string) {
+	if len(data) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=43200")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	_, _ = w.Write(data)
 }
 
 func (s *Server) servePageFallbackImage(w http.ResponseWriter, title string) {
@@ -1987,6 +2293,28 @@ func normalizeRootPathsInput(mt db.MountType, rootPath string, rootPaths []strin
 	return out, nil
 }
 
+func validateStoredMountBrowsePath(mount db.Mount, rawPath string) (string, error) {
+	target, err := canonicalizeLocalRootPath(rawPath)
+	if err != nil {
+		return "", err
+	}
+	roots := mount.RootPaths
+	if len(roots) == 0 && strings.TrimSpace(mount.RootPath) != "" {
+		roots = []string{mount.RootPath}
+	}
+	for _, root := range uniqueStrings(roots) {
+		canonicalRoot, rootErr := canonicalizeLocalRootPath(root)
+		if rootErr != nil {
+			continue
+		}
+		rootPrefix := canonicalRoot + string(filepath.Separator)
+		if target == canonicalRoot || strings.HasPrefix(target, rootPrefix) {
+			return target, nil
+		}
+	}
+	return "", fmt.Errorf("path is outside mount roots")
+}
+
 func normalizeRootPathForStorage(raw string) (string, error) {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -2155,7 +2483,14 @@ func readerSettingsDTO(v db.ReaderSettings) map[string]any {
 
 func runtimeSettingsDTO(v db.RuntimeSettings) map[string]any {
 	out := map[string]any{
-		"memory_limit_mb": v.MemoryLimitMB,
+		"memory_limit_mb":       v.MemoryLimitMB,
+		"disk_cache_mb":         v.DiskCacheMB,
+		"page_prefetch_pages":   v.PagePrefetchPages,
+		"page_load_parallelism": v.PageLoadParallelism,
+		"webp_quality":          v.WebPQuality,
+		"webp_method":           v.WebPMethod,
+		"webp_concurrency":      v.WebPConcurrency,
+		"webp_output_root":      v.WebPOutputRoot,
 	}
 	if !v.CreatedAt.IsZero() {
 		out["created_at"] = v.CreatedAt
@@ -2173,8 +2508,15 @@ func runtimeSettingsDTO(v db.RuntimeSettings) map[string]any {
 func runtimeSettingsFromConfig(rt config.RuntimeConfig) db.RuntimeSettings {
 	normalized := normalizeRuntimeConfig(rt)
 	return db.RuntimeSettings{
-		ID:            1,
-		MemoryLimitMB: normalized.MemoryLimitMB,
+		ID:                  1,
+		MemoryLimitMB:       normalized.MemoryLimitMB,
+		DiskCacheMB:         normalized.DiskCacheMB,
+		PagePrefetchPages:   normalized.PagePrefetchPages,
+		PageLoadParallelism: normalized.PageLoadParallelism,
+		WebPQuality:         normalized.WebPQuality,
+		WebPMethod:          normalized.WebPMethod,
+		WebPConcurrency:     normalized.WebPConcurrency,
+		WebPOutputRoot:      strings.TrimSpace(normalized.WebPOutputRoot),
 	}
 }
 
@@ -2183,6 +2525,25 @@ func normalizeRuntimeConfig(rt config.RuntimeConfig) config.RuntimeConfig {
 	if rt.MemoryLimitMB <= 0 {
 		rt.MemoryLimitMB = def.MemoryLimitMB
 	}
+	if rt.DiskCacheMB <= 0 {
+		rt.DiskCacheMB = def.DiskCacheMB
+	}
+	if rt.PagePrefetchPages < 0 {
+		rt.PagePrefetchPages = def.PagePrefetchPages
+	}
+	if rt.PageLoadParallelism <= 0 {
+		rt.PageLoadParallelism = def.PageLoadParallelism
+	}
+	if rt.WebPQuality <= 0 {
+		rt.WebPQuality = def.WebPQuality
+	}
+	if rt.WebPMethod < 0 {
+		rt.WebPMethod = def.WebPMethod
+	}
+	if rt.WebPConcurrency <= 0 {
+		rt.WebPConcurrency = def.WebPConcurrency
+	}
+	rt.WebPOutputRoot = strings.TrimSpace(rt.WebPOutputRoot)
 	return rt
 }
 
@@ -2192,6 +2553,42 @@ func validateRuntimeConfig(rt config.RuntimeConfig) error {
 	}
 	if rt.MemoryLimitMB > 32768 {
 		return errors.New("memory_limit_mb must be <= 32768")
+	}
+	if rt.DiskCacheMB < 256 {
+		return errors.New("disk_cache_mb must be >= 256")
+	}
+	if rt.DiskCacheMB > 1048576 {
+		return errors.New("disk_cache_mb must be <= 1048576")
+	}
+	if rt.PagePrefetchPages < 0 {
+		return errors.New("page_prefetch_pages must be >= 0")
+	}
+	if rt.PagePrefetchPages > 100 {
+		return errors.New("page_prefetch_pages must be <= 100")
+	}
+	if rt.PageLoadParallelism < 1 {
+		return errors.New("page_load_parallelism must be >= 1")
+	}
+	if rt.PageLoadParallelism > 16 {
+		return errors.New("page_load_parallelism must be <= 16")
+	}
+	if rt.WebPQuality < 1 {
+		return errors.New("webp_quality must be >= 1")
+	}
+	if rt.WebPQuality > 100 {
+		return errors.New("webp_quality must be <= 100")
+	}
+	if rt.WebPMethod < 0 {
+		return errors.New("webp_method must be >= 0")
+	}
+	if rt.WebPMethod > 6 {
+		return errors.New("webp_method must be <= 6")
+	}
+	if rt.WebPConcurrency < 1 {
+		return errors.New("webp_concurrency must be >= 1")
+	}
+	if rt.WebPConcurrency > 16 {
+		return errors.New("webp_concurrency must be <= 16")
 	}
 	return nil
 }
@@ -2209,9 +2606,27 @@ func (s *Server) applyRuntimeConfig(rt config.RuntimeConfig) {
 	s.runtimeMu.Lock()
 	s.runtimeCfg = normalized
 	s.runtimeMu.Unlock()
-	if s.logger != nil {
-		s.logger.Printf("runtime settings updated: memory_limit=%dMiB", normalized.MemoryLimitMB)
+	if s.pageCache != nil {
+		s.pageCache.SetMaxSizeBytes(normalized.DiskCacheMB << 20)
+		go func() {
+			_ = s.pageCache.Reap()
+		}()
 	}
+	if s.logger != nil {
+		s.logger.Printf("runtime settings updated: memory_limit=%dMiB disk_cache=%dMiB backend_prefetch_pages=%d page_load_parallelism=%d webp_quality=%d webp_method=%d webp_concurrency=%d webp_output_root=%q",
+			normalized.MemoryLimitMB, normalized.DiskCacheMB, normalized.PagePrefetchPages, normalized.PageLoadParallelism, normalized.WebPQuality, normalized.WebPMethod, normalized.WebPConcurrency, normalized.WebPOutputRoot)
+	}
+}
+
+func (s *Server) currentPageLoadParallelism() int {
+	value := int(s.currentRuntimeConfig().PageLoadParallelism)
+	if value < 1 {
+		return int(config.Default().Runtime.PageLoadParallelism)
+	}
+	if value > 16 {
+		return 16
+	}
+	return value
 }
 
 func (s *Server) withPageEnhanceSlot(fn func() ([]byte, error)) ([]byte, error) {
@@ -2224,6 +2639,7 @@ func (s *Server) withPageEnhanceSlot(fn func() ([]byte, error)) ([]byte, error) 
 	s.pageEnhanceSem <- struct{}{}
 	defer func() {
 		<-s.pageEnhanceSem
+		s.maybeReleaseMemory("page-enhance")
 	}()
 	return fn()
 }
@@ -2238,8 +2654,65 @@ func (s *Server) withPageEnhanceObjectSlot(fn func() (cache.CacheObject, error))
 	s.pageEnhanceSem <- struct{}{}
 	defer func() {
 		<-s.pageEnhanceSem
+		s.maybeReleaseMemory("page-enhance-object")
 	}()
 	return fn()
+}
+
+type memorySnapshot struct {
+	heapAlloc    uint64
+	heapRetained uint64
+}
+
+func captureMemorySnapshot() memorySnapshot {
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	retained := stats.HeapInuse
+	if stats.HeapIdle > stats.HeapReleased {
+		retained += stats.HeapIdle - stats.HeapReleased
+	}
+	return memorySnapshot{
+		heapAlloc:    stats.HeapAlloc,
+		heapRetained: retained,
+	}
+}
+
+func bytesToMiB(v uint64) uint64 {
+	return v >> 20
+}
+
+func (s *Server) maybeReleaseMemory(reason string) {
+	limitMB := s.currentRuntimeConfig().MemoryLimitMB
+	if limitMB <= 0 {
+		return
+	}
+	limitBytes := uint64(limitMB) << 20
+	before := captureMemorySnapshot()
+	if before.heapAlloc < (limitBytes*3)/5 && before.heapRetained < (limitBytes*3)/4 {
+		return
+	}
+
+	runtime.GC()
+	afterGC := captureMemorySnapshot()
+	if afterGC.heapAlloc < limitBytes/2 && afterGC.heapRetained < (limitBytes*7)/10 {
+		return
+	}
+
+	debug.FreeOSMemory()
+	if s.logger != nil {
+		afterFree := captureMemorySnapshot()
+		s.logger.Printf(
+			"memory reclaim after %s: heap_alloc=%d->%d->%d MiB retained=%d->%d->%d MiB limit=%d MiB",
+			reason,
+			bytesToMiB(before.heapAlloc),
+			bytesToMiB(afterGC.heapAlloc),
+			bytesToMiB(afterFree.heapAlloc),
+			bytesToMiB(before.heapRetained),
+			bytesToMiB(afterGC.heapRetained),
+			bytesToMiB(afterFree.heapRetained),
+			limitMB,
+		)
+	}
 }
 
 func defaultReaderSettings(userID int64) db.ReaderSettings {

@@ -156,7 +156,10 @@ func (s *Server) handleAPIAdminNameFormatApply(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	task := s.createArchiveTask(archiveActionFormatNames, mount)
+	task := s.createArchiveTask(archiveTaskCreateRequest{
+		Action: archiveActionFormatNames,
+		Mount:  mount,
+	})
 	go s.runNameFormatTask(task.ID, previewID, preview)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"ok":         true,

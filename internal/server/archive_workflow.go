@@ -27,6 +27,7 @@ const (
 	archiveActionOrganize    = "organize"
 	archiveActionRepack      = "repack"
 	archiveActionFormatNames = "format_names"
+	archiveActionWebPConvert = "webp_convert"
 
 	minComicImageCount = 11
 	archiveCopyBufSize = 1 << 20 // 1 MiB
@@ -42,6 +43,8 @@ type archiveWorkflowStats struct {
 	Zipped    int `json:"zipped"`
 	Skipped   int `json:"skipped"`
 	Failed    int `json:"failed"`
+	Partial   int `json:"partial,omitempty"`
+	Pending   int `json:"pending,omitempty"`
 }
 
 type archiveWorkflowRootResult struct {

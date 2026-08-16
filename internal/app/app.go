@@ -29,6 +29,7 @@ type App struct {
 	auth         *auth.Service
 	mountManager *mounts.Manager
 	coverCache   *cache.CoverCache
+	pageCache    *cache.PageCache
 	scanner      *scanner.Service
 	server       *server.Server
 }
@@ -76,9 +77,17 @@ func New(configPath, webDir string, logger *log.Logger) (*App, error) {
 	effectiveRuntime := cfg.Runtime
 	if runtimeSettings, rtErr := store.GetRuntimeSettings(); rtErr == nil {
 		effectiveRuntime.MemoryLimitMB = runtimeSettings.MemoryLimitMB
+		effectiveRuntime.DiskCacheMB = runtimeSettings.DiskCacheMB
+		effectiveRuntime.PagePrefetchPages = runtimeSettings.PagePrefetchPages
+		effectiveRuntime.PageLoadParallelism = runtimeSettings.PageLoadParallelism
+		effectiveRuntime.WebPQuality = runtimeSettings.WebPQuality
+		effectiveRuntime.WebPMethod = runtimeSettings.WebPMethod
+		effectiveRuntime.WebPConcurrency = runtimeSettings.WebPConcurrency
+		effectiveRuntime.WebPOutputRoot = runtimeSettings.WebPOutputRoot
 		cfg.Runtime = effectiveRuntime
 		if logger != nil {
-			logger.Printf("runtime settings loaded from db: memory_limit=%dMiB", effectiveRuntime.MemoryLimitMB)
+			logger.Printf("runtime settings loaded from db: memory_limit=%dMiB disk_cache=%dMiB backend_prefetch_pages=%d page_load_parallelism=%d webp_quality=%d webp_method=%d webp_concurrency=%d webp_output_root=%q",
+				effectiveRuntime.MemoryLimitMB, effectiveRuntime.DiskCacheMB, effectiveRuntime.PagePrefetchPages, effectiveRuntime.PageLoadParallelism, effectiveRuntime.WebPQuality, effectiveRuntime.WebPMethod, effectiveRuntime.WebPConcurrency, effectiveRuntime.WebPOutputRoot)
 		}
 	} else if !errors.Is(rtErr, sql.ErrNoRows) && logger != nil {
 		logger.Printf("runtime settings load warning: %v", rtErr)
@@ -120,6 +129,12 @@ func New(configPath, webDir string, logger *log.Logger) (*App, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	pageCache, err := cache.NewPageCache(store, cfg.Cache.Dir, cfg.Runtime.DiskCacheMB<<20)
+	if err != nil {
+		_ = mountManager.Close()
+		_ = store.Close()
+		return nil, err
+	}
 
 	if logger != nil {
 		logger.Printf("startup: initializing scanner")
@@ -135,6 +150,7 @@ func New(configPath, webDir string, logger *log.Logger) (*App, error) {
 		MountManager: mountManager,
 		Scanner:      scanSvc,
 		CoverCache:   coverCache,
+		PageCache:    pageCache,
 		Logger:       logger,
 		WebDir:       webDir,
 	})
@@ -154,6 +170,7 @@ func New(configPath, webDir string, logger *log.Logger) (*App, error) {
 		auth:         authSvc,
 		mountManager: mountManager,
 		coverCache:   coverCache,
+		pageCache:    pageCache,
 		scanner:      scanSvc,
 		server:       srv,
 	}, nil
@@ -294,6 +311,11 @@ func (a *App) periodicCacheReap(ctx context.Context) {
 		case <-t.C:
 			if err := a.coverCache.Reap(); err != nil && a.logger != nil {
 				a.logger.Printf("cache reap failed: %v", err)
+			}
+			if a.pageCache != nil {
+				if err := a.pageCache.Reap(); err != nil && a.logger != nil {
+					a.logger.Printf("page cache reap failed: %v", err)
+				}
 			}
 		}
 	}
