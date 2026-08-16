@@ -1570,7 +1570,22 @@ func dedupedComicBaseQuery() string {
 	`
 }
 
-func (s *Store) buildComicListFilter(userID int64, query string, mountID int64, statusFilter, formatFilter, favoriteFilter string) (string, []any, error) {
+func comicTopFolderExpr(pathExpr string) string {
+	return fmt.Sprintf("CASE WHEN instr(%s, '/') > 0 THEN substr(%s, 1, instr(%s, '/') - 1) ELSE '' END", pathExpr, pathExpr, pathExpr)
+}
+
+func normalizeFavoriteFilter(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return "all"
+	case "all", "favorite", "not_favorite":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "all"
+	}
+}
+
+func (s *Store) buildComicListFilter(userID int64, query string, mountID int64, statusFilter, formatFilter, favoriteFilter, folderFilter string) (string, []any, error) {
 	if userID <= 0 {
 		return "", nil, errors.New("invalid user id")
 	}
@@ -1586,16 +1601,13 @@ func (s *Store) buildComicListFilter(userID int64, query string, mountID int64, 
 	default:
 		format = "all"
 	}
-	favorite := strings.ToLower(strings.TrimSpace(favoriteFilter))
-	switch favorite {
-	case "", "all", "favorite", "not_favorite":
-	default:
-		favorite = "all"
-	}
+	favorite := normalizeFavoriteFilter(favoriteFilter)
+	folder := strings.TrimSpace(folderFilter)
 
 	progressTotalExpr := "CASE WHEN rp.total_pages > 0 THEN rp.total_pages WHEN c.page_count > 0 THEN c.page_count ELSE 0 END"
 	finishedExpr := fmt.Sprintf("(rp.id IS NOT NULL AND %s > 0 AND (rp.last_page + 1) >= %s)", progressTotalExpr, progressTotalExpr)
 	readingExpr := fmt.Sprintf("(rp.id IS NOT NULL AND NOT %s)", finishedExpr)
+	topFolderExpr := comicTopFolderExpr("c.path")
 
 	clauses := []string{"c.file_rank = 1"}
 	args := make([]any, 0, 8)
@@ -1608,6 +1620,10 @@ func (s *Store) buildComicListFilter(userID int64, query string, mountID int64, 
 	if q := strings.TrimSpace(query); q != "" {
 		clauses = append(clauses, "c.title LIKE ?")
 		args = append(args, "%"+q+"%")
+	}
+	if folder != "" {
+		clauses = append(clauses, topFolderExpr+" = ?")
+		args = append(args, folder)
 	}
 	switch status {
 	case "unread":
@@ -1634,8 +1650,8 @@ func (s *Store) buildComicListFilter(userID int64, query string, mountID int64, 
 	return strings.Join(clauses, " AND "), args, nil
 }
 
-func (s *Store) CountComicsForUser(userID int64, query string, mountID int64, statusFilter, formatFilter, favoriteFilter string) (int, error) {
-	where, args, err := s.buildComicListFilter(userID, query, mountID, statusFilter, formatFilter, favoriteFilter)
+func (s *Store) CountComicsForUser(userID int64, query string, mountID int64, statusFilter, formatFilter, favoriteFilter, folderFilter string) (int, error) {
+	where, args, err := s.buildComicListFilter(userID, query, mountID, statusFilter, formatFilter, favoriteFilter, folderFilter)
 	if err != nil {
 		return 0, err
 	}
@@ -1654,14 +1670,65 @@ func (s *Store) CountComicsForUser(userID int64, query string, mountID int64, st
 	return total, nil
 }
 
-func (s *Store) ListComicsForUser(userID int64, query string, mountID int64, statusFilter, formatFilter, favoriteFilter, sortBy, sortOrder string, limit, offset int) ([]ComicWithProgress, error) {
+func (s *Store) ListComicTopFoldersForUser(userID, mountID int64, favoriteFilter string) ([]string, error) {
+	if userID <= 0 {
+		return nil, errors.New("invalid user id")
+	}
+	if mountID <= 0 {
+		return []string{}, nil
+	}
+	favorite := normalizeFavoriteFilter(favoriteFilter)
+	args := []any{userID, mountID}
+	where := []string{
+		"c.file_rank = 1",
+		"c.mount_id = ?",
+		comicTopFolderExpr("c.path") + " <> ''",
+	}
+	switch favorite {
+	case "favorite":
+		where = append(where, "fc.user_id IS NOT NULL")
+	case "not_favorite":
+		where = append(where, "fc.user_id IS NULL")
+	}
+	stmt := fmt.Sprintf(`
+		%s
+		SELECT DISTINCT %s AS top_folder
+		FROM ranked_comics c
+		LEFT JOIN favorite_comics fc ON fc.comic_file_name_key = c.file_name_key AND fc.user_id = ?
+		WHERE %s
+		ORDER BY LOWER(top_folder), top_folder
+	`, dedupedComicBaseQuery(), comicTopFolderExpr("c.path"), strings.Join(where, " AND "))
+	rows, err := s.db.Query(stmt, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]string, 0)
+	for rows.Next() {
+		var folder string
+		if err := rows.Scan(&folder); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(folder) == "" {
+			continue
+		}
+		out = append(out, folder)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListComicsForUser(userID int64, query string, mountID int64, statusFilter, formatFilter, favoriteFilter, folderFilter, sortBy, sortOrder string, limit, offset int) ([]ComicWithProgress, error) {
 	if limit <= 0 {
 		limit = 200
 	}
 	if offset < 0 {
 		offset = 0
 	}
-	where, args, err := s.buildComicListFilter(userID, query, mountID, statusFilter, formatFilter, favoriteFilter)
+	where, args, err := s.buildComicListFilter(userID, query, mountID, statusFilter, formatFilter, favoriteFilter, folderFilter)
 	if err != nil {
 		return nil, err
 	}

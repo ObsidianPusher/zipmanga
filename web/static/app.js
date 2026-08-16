@@ -156,9 +156,9 @@
 
     searchInput: document.getElementById('searchInput'),
     mountFilter: document.getElementById('mountFilter'),
+    folderFilter: document.getElementById('folderFilter'),
     sortRule: document.getElementById('sortRule'),
     statusFilter: document.getElementById('statusFilter'),
-    formatFilter: document.getElementById('formatFilter'),
     refreshBtn: document.getElementById('refreshBtn'),
     summaryText: document.getElementById('summaryText'),
     libraryPrevPageBtn: document.getElementById('libraryPrevPageBtn'),
@@ -172,6 +172,8 @@
     favoritesPageText: document.getElementById('favoritesPageText'),
     favoritesPageSize: document.getElementById('favoritesPageSize'),
     favoritesRefreshBtn: document.getElementById('favoritesRefreshBtn'),
+    favoritesMountFilter: document.getElementById('favoritesMountFilter'),
+    favoritesFolderFilter: document.getElementById('favoritesFolderFilter'),
     favoritesGrid: document.getElementById('favoritesGrid'),
     historyGrid: document.getElementById('historyGrid'),
 
@@ -273,6 +275,16 @@
   let lastScanRunning = false;
   let lastScannedCount = 0;
   let settingsSaveTimer = null;
+
+  function applyPendingSelectValue(selectEl, fallbackValue) {
+    if (!selectEl) return;
+    const pending = typeof selectEl.dataset.pendingValue === 'string' ? selectEl.dataset.pendingValue : '';
+    const target = pending || String(fallbackValue || '');
+    if (target && [...selectEl.options].some(o => o.value === target)) {
+      selectEl.value = target;
+    }
+    delete selectEl.dataset.pendingValue;
+  }
 
   function cloneDefaultSettings() {
     return { ...DEFAULT_SETTINGS };
@@ -1737,9 +1749,9 @@
     return {
       q: el.searchInput ? el.searchInput.value.trim() : '',
       mount_id: el.mountFilter ? String(el.mountFilter.value || '') : '',
+      folder: el.folderFilter ? String(el.folderFilter.value || '') : '',
       sort_rule: el.sortRule ? String(el.sortRule.value || 'updated_desc') : 'updated_desc',
       status: el.statusFilter ? String(el.statusFilter.value || 'all') : 'all',
-      format: el.formatFilter ? String(el.formatFilter.value || 'all') : 'all',
       page: Math.max(1, Number(state.library.page || 1)),
       page_size: normalizeLibraryPageSize(state.library.pageSize),
       scroll_y: Number.isFinite(scrollYOverride) ? Math.max(0, Math.floor(scrollYOverride)) : Math.max(0, Math.floor(window.scrollY || 0)),
@@ -1768,13 +1780,12 @@
         const found = [...el.statusFilter.options].some(o => o.value === saved.status);
         if (found) el.statusFilter.value = saved.status;
       }
-      if (el.formatFilter && typeof saved.format === 'string') {
-        const found = [...el.formatFilter.options].some(o => o.value === saved.format);
-        if (found) el.formatFilter.value = saved.format;
-      }
       if (el.mountFilter && typeof saved.mount_id === 'string') {
         const found = [...el.mountFilter.options].some(o => o.value === saved.mount_id);
         if (found) el.mountFilter.value = saved.mount_id;
+      }
+      if (el.folderFilter && typeof saved.folder === 'string') {
+        el.folderFilter.dataset.pendingValue = saved.folder;
       }
       const savedPageSize = normalizeLibraryPageSize(saved.page_size);
       state.library.pageSize = savedPageSize;
@@ -1843,21 +1854,24 @@
     if (!data) return;
     state.mounts = data.items || [];
 
-    if (el.mountFilter) {
-      const current = el.mountFilter.value;
-      el.mountFilter.innerHTML = '';
+    const enabledMounts = state.mounts.filter(m => m.enabled);
+    [el.mountFilter, el.favoritesMountFilter].forEach((selectEl) => {
+      if (!selectEl) return;
+      const current = String(selectEl.value || '');
+      selectEl.innerHTML = '';
       const all = document.createElement('option');
       all.value = '';
       all.textContent = '全部挂载';
-      el.mountFilter.appendChild(all);
-      state.mounts.filter(m => m.enabled).forEach(m => {
+      selectEl.appendChild(all);
+      enabledMounts.forEach((m) => {
         const opt = document.createElement('option');
         opt.value = String(m.id);
         opt.textContent = `${m.name} (${mountTypeName(m.type)})`;
-        el.mountFilter.appendChild(opt);
+        selectEl.appendChild(opt);
       });
-      if ([...el.mountFilter.options].some(o => o.value === current)) el.mountFilter.value = current;
-    }
+      if ([...selectEl.options].some(o => o.value === current)) selectEl.value = current;
+      applyPendingSelectValue(selectEl, current);
+    });
 
     if (isAdmin) {
       if (el.mountList) renderMountList();
@@ -1865,6 +1879,47 @@
       renderWebPSourceRootOptions();
       renderWebPOutputRootOptions();
     }
+  }
+
+  async function loadComicFolderOptions(selectEl, mountIDValue, options) {
+    if (!selectEl) return;
+    const opts = options || {};
+    const current = String(selectEl.value || '');
+    const pending = typeof selectEl.dataset.pendingValue === 'string' ? selectEl.dataset.pendingValue : '';
+    const mountID = String(mountIDValue || '').trim();
+    selectEl.innerHTML = '';
+
+    const all = document.createElement('option');
+    all.value = '';
+    all.textContent = mountID ? '全部文件夹' : '先选择挂载';
+    selectEl.appendChild(all);
+
+    if (!mountID) {
+      selectEl.value = '';
+      selectEl.disabled = true;
+      delete selectEl.dataset.pendingValue;
+      return;
+    }
+
+    const params = new URLSearchParams({ mount_id: mountID });
+    if (opts.favoriteOnly) params.set('favorite', 'favorite');
+    const data = await fetchJSON(`api/comics/folders?${params.toString()}`);
+    const items = Array.isArray(data?.items) ? data.items : [];
+    items.forEach((item) => {
+      const opt = document.createElement('option');
+      opt.value = String(item?.value || '');
+      opt.textContent = String(item?.label || item?.value || '');
+      selectEl.appendChild(opt);
+    });
+    selectEl.disabled = false;
+
+    const nextValue = pending || current;
+    if (nextValue && [...selectEl.options].some(o => o.value === nextValue)) {
+      selectEl.value = nextValue;
+    } else {
+      selectEl.value = '';
+    }
+    delete selectEl.dataset.pendingValue;
   }
 
   function renderComicCards(container, items, options) {
@@ -2010,7 +2065,7 @@
     if (el.searchInput && el.searchInput.value.trim()) params.set('q', el.searchInput.value.trim());
     if (el.mountFilter && el.mountFilter.value) params.set('mount_id', el.mountFilter.value);
     if (el.statusFilter && el.statusFilter.value) params.set('status', el.statusFilter.value);
-    if (el.formatFilter && el.formatFilter.value && el.formatFilter.value !== 'all') params.set('format', el.formatFilter.value);
+    if (el.folderFilter && el.folderFilter.value) params.set('folder', el.folderFilter.value);
     const sortRule = parseSortRule(el.sortRule ? el.sortRule.value : 'updated_desc');
     params.set('sort', sortRule.sort);
     params.set('order', sortRule.order);
@@ -2064,6 +2119,8 @@
     params.set('favorite', 'favorite');
     params.set('sort', 'updated_at');
     params.set('order', 'desc');
+    if (el.favoritesMountFilter && el.favoritesMountFilter.value) params.set('mount_id', el.favoritesMountFilter.value);
+    if (el.favoritesFolderFilter && el.favoritesFolderFilter.value) params.set('folder', el.favoritesFolderFilter.value);
     params.set('page', String(page));
     params.set('page_size', String(pageSize));
 
@@ -2521,12 +2578,23 @@
     return !!token && token === (slot.dataset.renderToken || '') && img.dataset.state === 'loading';
   }
 
-  async function safeDrawPage(pageIndex, slot) {
+  function createStaleRenderError() {
+    const err = new Error('stale reader render');
+    err.staleRender = true;
+    return err;
+  }
+
+  async function safeDrawPage(pageIndex, slot, expectedEpoch = state.renderEpoch) {
     try {
-      await drawPageToCanvas(pageIndex, slot);
+      await drawPageToCanvas(pageIndex, slot, expectedEpoch);
       return true;
-    } catch (_) {
-      hideReaderPageSlot(slot);
+    } catch (err) {
+      if (err && err.staleRender) {
+        return true;
+      }
+      if (expectedEpoch === state.renderEpoch) {
+        hideReaderPageSlot(slot);
+      }
       return false;
     }
   }
@@ -2595,17 +2663,21 @@
     }
   }
 
-  async function drawPageToCanvas(pageIndex, slot) {
+  async function drawPageToCanvas(pageIndex, slot, expectedEpoch = state.renderEpoch) {
     if (!slot) return;
     if (pageIndex < 0 || (state.reader.pageCountKnown && pageIndex >= state.reader.totalPages)) {
       hideReaderPageSlot(slot);
       return;
     }
+    if (expectedEpoch !== state.renderEpoch) {
+      throw createStaleRenderError();
+    }
 
-    const renderEpoch = state.renderEpoch;
     let requestedWidth = computeRequestedWidth(slot);
     let img = await getImage(pageIndex, requestedWidth);
-    if (renderEpoch !== state.renderEpoch) return;
+    if (expectedEpoch !== state.renderEpoch) {
+      throw createStaleRenderError();
+    }
     const fit = state.reader.settings.mode === 'scroll' ? 'width' : state.reader.settings.fit;
     const { img: targetImg, error } = getReaderPageSlotParts(slot);
     if (!targetImg || !error) return;
@@ -2657,6 +2729,9 @@
     const nextSrc = img.currentSrc || img.src;
     if (!nextSrc) {
       throw new Error('empty image source');
+    }
+    if (expectedEpoch !== state.renderEpoch) {
+      throw createStaleRenderError();
     }
     const nextToken = nextReaderSlotRenderToken(slot, pageIndex);
     const currentSrc = targetImg.currentSrc || targetImg.src || '';
@@ -2723,18 +2798,19 @@
       if (el.pagedSlotRight) el.pagedSlotRight.hidden = false;
       if (isRTL()) {
         // Right-open: current page at right side, next page at left side.
-        await safeDrawPage(page + 1, el.pagedSlotLeft);
+        await safeDrawPage(page + 1, el.pagedSlotLeft, renderEpoch);
         if (renderEpoch !== state.renderEpoch) return;
-        mainPageOK = await safeDrawPage(page, el.pagedSlotRight);
+        mainPageOK = await safeDrawPage(page, el.pagedSlotRight, renderEpoch);
       } else {
-        mainPageOK = await safeDrawPage(page, el.pagedSlotLeft);
+        mainPageOK = await safeDrawPage(page, el.pagedSlotLeft, renderEpoch);
         if (renderEpoch !== state.renderEpoch) return;
-        await safeDrawPage(page + 1, el.pagedSlotRight);
+        await safeDrawPage(page + 1, el.pagedSlotRight, renderEpoch);
       }
     } else {
-      mainPageOK = await safeDrawPage(page, el.pagedSlotLeft);
+      mainPageOK = await safeDrawPage(page, el.pagedSlotLeft, renderEpoch);
       hideReaderPageSlot(el.pagedSlotRight);
     }
+    if (renderEpoch !== state.renderEpoch) return;
 
     if (!mainPageOK && !state.reader.pageCountKnown && page > 0) {
       const discovered = Math.max(1, page);
@@ -3785,6 +3861,7 @@
     }
     await loadMounts();
     restoreLibraryState();
+    await loadComicFolderOptions(el.folderFilter, el.mountFilter ? el.mountFilter.value : '', {});
     updateLibraryPagerUI();
     await loadComics();
     applyPendingLibraryScroll();
@@ -3802,6 +3879,10 @@
     }
     if (el.mountFilter) {
       el.mountFilter.addEventListener('change', async () => {
+        if (el.folderFilter) {
+          el.folderFilter.dataset.pendingValue = '';
+          await loadComicFolderOptions(el.folderFilter, el.mountFilter.value, {});
+        }
         state.library.page = 1;
         await loadComics();
         window.scrollTo({ top: 0, behavior: 'auto' });
@@ -3824,8 +3905,8 @@
         saveLibraryState(0);
       });
     }
-    if (el.formatFilter) {
-      el.formatFilter.addEventListener('change', async () => {
+    if (el.folderFilter) {
+      el.folderFilter.addEventListener('change', async () => {
         state.library.page = 1;
         await loadComics();
         window.scrollTo({ top: 0, behavior: 'auto' });
@@ -3835,6 +3916,7 @@
     if (el.refreshBtn) {
       el.refreshBtn.addEventListener('click', async () => {
         await loadMounts();
+        await loadComicFolderOptions(el.folderFilter, el.mountFilter ? el.mountFilter.value : '', {});
         await loadComics();
       });
     }
@@ -3870,9 +3952,29 @@
     if (el.favoritesPageSize) {
       el.favoritesPageSize.value = String(normalizeLibraryPageSize(state.favorites.pageSize));
     }
+    await loadMounts();
+    await loadComicFolderOptions(el.favoritesFolderFilter, el.favoritesMountFilter ? el.favoritesMountFilter.value : '', { favoriteOnly: true });
     updateFavoritesPagerUI();
     await loadFavoriteComics();
 
+    if (el.favoritesMountFilter) {
+      el.favoritesMountFilter.addEventListener('change', async () => {
+        if (el.favoritesFolderFilter) {
+          el.favoritesFolderFilter.dataset.pendingValue = '';
+          await loadComicFolderOptions(el.favoritesFolderFilter, el.favoritesMountFilter.value, { favoriteOnly: true });
+        }
+        state.favorites.page = 1;
+        await loadFavoriteComics();
+        window.scrollTo({ top: 0, behavior: 'auto' });
+      });
+    }
+    if (el.favoritesFolderFilter) {
+      el.favoritesFolderFilter.addEventListener('change', async () => {
+        state.favorites.page = 1;
+        await loadFavoriteComics();
+        window.scrollTo({ top: 0, behavior: 'auto' });
+      });
+    }
     if (el.favoritesPageSize) {
       el.favoritesPageSize.addEventListener('change', async () => {
         state.favorites.pageSize = normalizeLibraryPageSize(el.favoritesPageSize.value);
@@ -3893,6 +3995,8 @@
     }
     if (el.favoritesRefreshBtn) {
       el.favoritesRefreshBtn.addEventListener('click', async () => {
+        await loadMounts();
+        await loadComicFolderOptions(el.favoritesFolderFilter, el.favoritesMountFilter ? el.favoritesMountFilter.value : '', { favoriteOnly: true });
         await loadFavoriteComics();
       });
     }

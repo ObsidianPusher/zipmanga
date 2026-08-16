@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -399,7 +400,7 @@ func TestLibraryDedupesByFileNameAndPrefersLargerFile(t *testing.T) {
 		t.Fatalf("ReplaceComicsForMount mountB failed: %v", err)
 	}
 
-	total, err := store.CountComicsForUser(user.ID, "", 0, "all", "all", "all")
+	total, err := store.CountComicsForUser(user.ID, "", 0, "all", "all", "all", "")
 	if err != nil {
 		t.Fatalf("CountComicsForUser failed: %v", err)
 	}
@@ -407,7 +408,7 @@ func TestLibraryDedupesByFileNameAndPrefersLargerFile(t *testing.T) {
 		t.Fatalf("deduped total=%d want=1", total)
 	}
 
-	items, err := store.ListComicsForUser(user.ID, "", 0, "all", "all", "all", "size", "desc", 50, 0)
+	items, err := store.ListComicsForUser(user.ID, "", 0, "all", "all", "all", "", "size", "desc", 50, 0)
 	if err != nil {
 		t.Fatalf("ListComicsForUser failed: %v", err)
 	}
@@ -422,6 +423,89 @@ func TestLibraryDedupesByFileNameAndPrefersLargerFile(t *testing.T) {
 	}
 	if items[0].Title != "MyBook large" {
 		t.Fatalf("selected title=%q want=%q", items[0].Title, "MyBook large")
+	}
+}
+
+func TestComicFolderFiltersAndOptions(t *testing.T) {
+	store := openTestStore(t)
+
+	user, err := store.CreateUser("folder-user", "hash", false)
+	if err != nil {
+		t.Fatalf("CreateUser failed: %v", err)
+	}
+	mount, err := store.CreateMount(Mount{
+		Name:     "folder-mount",
+		Type:     MountTypeLocal,
+		RootPath: "/comics",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateMount failed: %v", err)
+	}
+	if err := store.ReplaceComicsForMount(mount.ID, []Comic{
+		{MountID: mount.ID, Path: "Alpha/Book-1.zip", Title: "Alpha 1", FileNameKey: "alpha-1.zip", MtimeUnix: 101, Size: 1000, PageCount: 10},
+		{MountID: mount.ID, Path: "Alpha/Book-2.zip", Title: "Alpha 2", FileNameKey: "alpha-2.zip", MtimeUnix: 102, Size: 1001, PageCount: 11},
+		{MountID: mount.ID, Path: "Beta/Book-3.zip", Title: "Beta 1", FileNameKey: "beta-1.zip", MtimeUnix: 103, Size: 1002, PageCount: 12},
+		{MountID: mount.ID, Path: "Loose.pdf", Title: "Loose", FileNameKey: "loose.pdf", MtimeUnix: 104, Size: 1003, PageCount: 13},
+	}); err != nil {
+		t.Fatalf("ReplaceComicsForMount failed: %v", err)
+	}
+
+	comics, err := store.ListComicsByMount(mount.ID)
+	if err != nil {
+		t.Fatalf("ListComicsByMount failed: %v", err)
+	}
+	var betaComic Comic
+	foundBeta := false
+	for _, comic := range comics {
+		if comic.Path == "Beta/Book-3.zip" {
+			betaComic = comic
+			foundBeta = true
+			break
+		}
+	}
+	if !foundBeta {
+		t.Fatal("expected Beta/Book-3.zip to exist")
+	}
+	if err := store.SetComicFavorite(user.ID, betaComic.ID, betaComic.FileNameKey, true); err != nil {
+		t.Fatalf("SetComicFavorite failed: %v", err)
+	}
+
+	items, err := store.ListComicsForUser(user.ID, "", mount.ID, "all", "all", "all", "Alpha", "title", "asc", 20, 0)
+	if err != nil {
+		t.Fatalf("ListComicsForUser folder filter failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("folder-filtered items len=%d want=2", len(items))
+	}
+	for _, item := range items {
+		if !strings.HasPrefix(item.Path, "Alpha/") {
+			t.Fatalf("unexpected path %q for Alpha filter", item.Path)
+		}
+	}
+
+	total, err := store.CountComicsForUser(user.ID, "", mount.ID, "all", "all", "all", "Beta")
+	if err != nil {
+		t.Fatalf("CountComicsForUser folder filter failed: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("folder-filtered total=%d want=1", total)
+	}
+
+	folders, err := store.ListComicTopFoldersForUser(user.ID, mount.ID, "all")
+	if err != nil {
+		t.Fatalf("ListComicTopFoldersForUser failed: %v", err)
+	}
+	if got := strings.Join(folders, ","); got != "Alpha,Beta" {
+		t.Fatalf("folders=%q want=%q", got, "Alpha,Beta")
+	}
+
+	favoriteFolders, err := store.ListComicTopFoldersForUser(user.ID, mount.ID, "favorite")
+	if err != nil {
+		t.Fatalf("ListComicTopFoldersForUser favorite failed: %v", err)
+	}
+	if len(favoriteFolders) != 1 || favoriteFolders[0] != "Beta" {
+		t.Fatalf("favorite folders=%v want=[Beta]", favoriteFolders)
 	}
 }
 

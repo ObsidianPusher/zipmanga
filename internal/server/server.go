@@ -190,6 +190,7 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /api/scan/status", s.authRequired(s.adminOnly(s.handleAPIScanStatus)))
 
 	s.router.HandleFunc("GET /api/comics", s.authRequired(s.handleAPIListComics))
+	s.router.HandleFunc("GET /api/comics/folders", s.authRequired(s.handleAPIListComicFolders))
 	s.router.HandleFunc("GET /api/comics/{id}", s.authRequired(s.handleAPIComicDetail))
 	s.router.HandleFunc("GET /api/comics/{id}/cover", s.authRequired(s.handleAPIComicCover))
 	s.router.HandleFunc("GET /api/comics/{id}/file", s.authRequired(s.handleAPIComicFile))
@@ -988,6 +989,7 @@ func (s *Server) handleAPIListComics(w http.ResponseWriter, r *http.Request) {
 	statusFilter := strings.TrimSpace(r.URL.Query().Get("status"))
 	formatFilter := strings.TrimSpace(r.URL.Query().Get("format"))
 	favoriteFilter := strings.TrimSpace(r.URL.Query().Get("favorite"))
+	folderFilter := strings.TrimSpace(r.URL.Query().Get("folder"))
 	sortBy := strings.TrimSpace(r.URL.Query().Get("sort"))
 	sortOrder := strings.TrimSpace(r.URL.Query().Get("order"))
 	page := parseBoundedInt(strings.TrimSpace(r.URL.Query().Get("page")), 1, 1, 500000)
@@ -999,7 +1001,7 @@ func (s *Server) handleAPIListComics(w http.ResponseWriter, r *http.Request) {
 		offset = (page - 1) * pageSize
 	}
 
-	total, err := s.store.CountComicsForUser(u.ID, q, mountID, statusFilter, formatFilter, favoriteFilter)
+	total, err := s.store.CountComicsForUser(u.ID, q, mountID, statusFilter, formatFilter, favoriteFilter, folderFilter)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -1017,7 +1019,7 @@ func (s *Server) handleAPIListComics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	items, err := s.store.ListComicsForUser(u.ID, q, mountID, statusFilter, formatFilter, favoriteFilter, sortBy, sortOrder, limit, offset)
+	items, err := s.store.ListComicsForUser(u.ID, q, mountID, statusFilter, formatFilter, favoriteFilter, folderFilter, sortBy, sortOrder, limit, offset)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -1042,6 +1044,41 @@ func (s *Server) handleAPIListComics(w http.ResponseWriter, r *http.Request) {
 			"total_pages": totalPages,
 		},
 	})
+}
+
+func (s *Server) handleAPIListComicFolders(w http.ResponseWriter, r *http.Request) {
+	u, ok := userFromCtx(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	mountID, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("mount_id")), 10, 64)
+	if mountID <= 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []map[string]any{}})
+		return
+	}
+	mount, err := s.store.GetMount(mountID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "mount not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	folders, err := s.store.ListComicTopFoldersForUser(u.ID, mountID, strings.TrimSpace(r.URL.Query().Get("favorite")))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	items := make([]map[string]any, 0, len(folders))
+	for _, raw := range folders {
+		items = append(items, map[string]any{
+			"value": raw,
+			"label": mountFolderLabel(mount, raw),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (s *Server) handleAPIComicDetail(w http.ResponseWriter, r *http.Request) {
@@ -2797,6 +2834,48 @@ func mountPublicDTO(m db.Mount) map[string]any {
 		"enabled":    m.Enabled,
 		"created_at": m.CreatedAt,
 	}
+}
+
+func mountRootDisplayLabels(m db.Mount) []string {
+	roots := append([]string(nil), m.RootPaths...)
+	if len(roots) == 0 && strings.TrimSpace(m.RootPath) != "" {
+		roots = []string{m.RootPath}
+	}
+	labels := make([]string, 0, len(roots))
+	used := make(map[string]int, len(roots))
+	for idx, root := range roots {
+		trimmed := strings.TrimSpace(root)
+		label := path.Base(strings.ReplaceAll(trimmed, "\\", "/"))
+		if label == "." || label == "/" || label == "" {
+			label = trimmed
+		}
+		if label == "" {
+			label = fmt.Sprintf("root-%d", idx+1)
+		}
+		used[label]++
+		if used[label] > 1 {
+			label = fmt.Sprintf("%s (%d)", label, used[label])
+		}
+		labels = append(labels, label)
+	}
+	return labels
+}
+
+func mountFolderLabel(m db.Mount, raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	if strings.HasPrefix(value, "__root") && strings.HasSuffix(value, "__") {
+		numRaw := strings.TrimSuffix(strings.TrimPrefix(value, "__root"), "__")
+		if idx, err := strconv.Atoi(numRaw); err == nil {
+			labels := mountRootDisplayLabels(m)
+			if idx >= 0 && idx < len(labels) && strings.TrimSpace(labels[idx]) != "" {
+				return labels[idx]
+			}
+		}
+	}
+	return value
 }
 
 func rootDirectoryDTO(item db.RootDirectory) map[string]any {

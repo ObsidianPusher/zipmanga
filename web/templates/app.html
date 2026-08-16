@@ -32,7 +32,7 @@
       <section class="panel hero-card">
         <div class="hero-title">
           <h1>漫画书库</h1>
-          <p>按挂载统一检索，支持状态筛选、排序与进度恢复。</p>
+          <p>按挂载与文件夹统一检索，支持状态筛选、排序与进度恢复。</p>
         </div>
         <div class="hero-meta">
           <span id="summaryText">加载中...</span>
@@ -55,12 +55,7 @@
             <option value="reading">阅读中</option>
             <option value="finished">已读完</option>
           </select></div>
-        <div class="field"><select id="formatFilter">
-            <option value="all">全部类型</option>
-            <option value="archive">压缩包（ZIP）</option>
-            <option value="zip">ZIP/CBZ</option>
-            <option value="pdf">PDF</option>
-          </select></div>
+        <div class="field"><select id="folderFilter"></select></div>
         <div class="field"><button id="refreshBtn" class="btn">刷新</button></div>
       </div>
 
@@ -95,6 +90,12 @@
         </div>
       </section>
 
+      <div class="glass tools-row">
+        <div class="field"><select id="favoritesMountFilter"></select></div>
+        <div class="field"><select id="favoritesFolderFilter"></select></div>
+        <div class="field"><button id="favoritesRefreshBtn" class="btn" type="button">刷新</button></div>
+      </div>
+
       <div class="library-pagination" aria-label="收藏分页">
         <div class="pager-main">
           <button id="favoritesPrevPageBtn" class="btn" type="button">上一页</button>
@@ -109,7 +110,6 @@
             <option value="200">200</option>
             <option value="500">500</option>
           </select>
-          <button id="favoritesRefreshBtn" class="btn" type="button">刷新</button>
         </div>
       </div>
 
