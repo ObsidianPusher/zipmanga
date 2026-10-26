@@ -351,6 +351,15 @@ func (s *Server) convertArchiveJobToWebP(task *webpTask, job webpConvertArchiveJ
 		Method:  int(task.Method),
 	}
 	if err := writeWebPArchiveOutput(job.SourcePath, job.FinalZip, entries, options, int(task.Concurrency), func() bool {
+		// Yield between entries before acquiring any image resources. Keep
+		// cancellation responsive and bound a busy reader's delay of this job.
+		deadline := time.Now().Add(2 * time.Second)
+		for s.interactiveReads.Load() > 0 && time.Now().Before(deadline) {
+			if s.isWebPTaskCancelRequested(task.ID) {
+				return true
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
 		return s.isWebPTaskCancelRequested(task.ID)
 	}, progressCB, &stats); err != nil {
 		return stats, err

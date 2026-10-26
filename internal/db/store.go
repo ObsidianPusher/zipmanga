@@ -147,6 +147,17 @@ func (s *Store) Migrate() error {
 				UNIQUE(user_id, comic_id)
 			)`,
 		`CREATE INDEX IF NOT EXISTS idx_reading_progress_user_updated ON reading_progress(user_id, updated_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS comic_reader_states (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            mount_id INTEGER NOT NULL REFERENCES mounts(id) ON DELETE CASCADE,
+            comic_path TEXT NOT NULL,
+            settings TEXT NOT NULL,
+            last_page INTEGER NOT NULL,
+            total_pages INTEGER NOT NULL,
+            page_offset REAL NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(user_id, mount_id, comic_path)
+        )`,
 		`CREATE TABLE IF NOT EXISTS root_directories (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
@@ -154,6 +165,9 @@ func (s *Store) Migrate() error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS user_reader_settings (
+            quality TEXT NOT NULL DEFAULT 'standard',
+            spread TEXT NOT NULL DEFAULT 'auto',
+            cover_offset INTEGER NOT NULL DEFAULT 1,
 			user_id INTEGER PRIMARY KEY,
 			mode TEXT NOT NULL,
 			fit TEXT NOT NULL,
@@ -284,6 +298,15 @@ func (s *Store) ValidateAndRepairSchema() error {
 	}
 	if err := s.ensureFavoriteComicsSchema(); err != nil {
 		return err
+	}
+	for _, column := range []struct{ name, ddl string }{
+		{"quality", "ALTER TABLE user_reader_settings ADD COLUMN quality TEXT NOT NULL DEFAULT 'standard'"},
+		{"spread", "ALTER TABLE user_reader_settings ADD COLUMN spread TEXT NOT NULL DEFAULT 'auto'"},
+		{"cover_offset", "ALTER TABLE user_reader_settings ADD COLUMN cover_offset INTEGER NOT NULL DEFAULT 1"},
+	} {
+		if err := s.ensureColumn("user_reader_settings", column.name, column.ddl); err != nil {
+			return err
+		}
 	}
 	if err := s.ensureColumn("reading_progress", "comic_id", `ALTER TABLE reading_progress ADD COLUMN comic_id INTEGER`); err != nil {
 		return err
@@ -1024,7 +1047,7 @@ func (s *Store) UpdateUserPassword(id int64, passwordHash string) error {
 
 func (s *Store) GetReaderSettings(userID int64) (ReaderSettings, error) {
 	row := s.db.QueryRow(`
-		SELECT user_id, mode, fit, enhance_zip, enhance_pdf, spread_direction, mobile_compact, created_at, updated_at
+		SELECT user_id, mode, fit, enhance_zip, enhance_pdf, spread_direction, mobile_compact, quality, spread, cover_offset, created_at, updated_at
 		FROM user_reader_settings
 		WHERE user_id = ?
 	`, userID)
@@ -1039,9 +1062,9 @@ func (s *Store) UpsertReaderSettings(v ReaderSettings) error {
 	}
 	_, err := s.db.Exec(`
 		INSERT INTO user_reader_settings (
-			user_id, mode, fit, enhance_zip, enhance_pdf, spread_direction, mobile_compact, created_at, updated_at
+			user_id, mode, fit, enhance_zip, enhance_pdf, spread_direction, mobile_compact, quality, spread, cover_offset, created_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(user_id) DO UPDATE SET
 			mode=excluded.mode,
 			fit=excluded.fit,
@@ -1049,9 +1072,10 @@ func (s *Store) UpsertReaderSettings(v ReaderSettings) error {
 			enhance_pdf=excluded.enhance_pdf,
 			spread_direction=excluded.spread_direction,
 			mobile_compact=excluded.mobile_compact,
+ quality=excluded.quality,spread=excluded.spread,cover_offset=excluded.cover_offset,
 			updated_at=excluded.updated_at
 	`, v.UserID, strings.TrimSpace(v.Mode), strings.TrimSpace(v.Fit), strings.TrimSpace(v.EnhanceZip),
-		strings.TrimSpace(v.EnhancePDF), strings.TrimSpace(v.SpreadDirection), boolToInt(v.MobileCompact), createdAt, now)
+		strings.TrimSpace(v.EnhancePDF), strings.TrimSpace(v.SpreadDirection), boolToInt(v.MobileCompact), v.Quality, v.Spread, boolToInt(v.CoverOffset), createdAt, now)
 	return err
 }
 
@@ -1966,7 +1990,6 @@ func (s *Store) UpsertReadingProgress(userID, comicID int64, fileNameKey string,
 	if err = tx.Commit(); err != nil {
 		return ReadingProgress{}, err
 	}
-	_ = s.CleanupOldHistory(userID, 100)
 	return s.GetReadingProgressByFileName(userID, fileNameKey)
 }
 
@@ -2624,12 +2647,13 @@ func scanReadingProgress(scanner interface{ Scan(dest ...any) error }) (ReadingP
 
 func scanReaderSettings(scanner interface{ Scan(dest ...any) error }) (ReaderSettings, error) {
 	var v ReaderSettings
-	var mobileCompact int
+	var mobileCompact, coverOffset int
 	var createdRaw, updatedRaw string
-	if err := scanner.Scan(&v.UserID, &v.Mode, &v.Fit, &v.EnhanceZip, &v.EnhancePDF, &v.SpreadDirection, &mobileCompact, &createdRaw, &updatedRaw); err != nil {
+	if err := scanner.Scan(&v.UserID, &v.Mode, &v.Fit, &v.EnhanceZip, &v.EnhancePDF, &v.SpreadDirection, &mobileCompact, &v.Quality, &v.Spread, &coverOffset, &createdRaw, &updatedRaw); err != nil {
 		return ReaderSettings{}, err
 	}
 	v.MobileCompact = intToBool(mobileCompact)
+	v.CoverOffset = intToBool(coverOffset)
 	var err error
 	v.CreatedAt, err = time.Parse(time.RFC3339Nano, createdRaw)
 	if err != nil {
@@ -2670,4 +2694,82 @@ func boolToInt(v bool) int {
 
 func intToBool(v int) bool {
 	return v != 0
+}
+
+var ErrReaderStateConflict = errors.New("reader state is newer than submitted update")
+
+func (s *Store) GetComicReaderState(userID, comicID int64) (ComicReaderState, error) {
+	var state ComicReaderState
+	var settings string
+	var updated int64
+	err := s.db.QueryRow(`SELECT rs.settings, rs.last_page, rs.total_pages, rs.page_offset, rs.updated_at
+ FROM comic_reader_states rs JOIN comics c ON c.mount_id=rs.mount_id AND c.path=rs.comic_path
+ WHERE rs.user_id=? AND c.id=?`, userID, comicID).Scan(&settings, &state.LastPage, &state.TotalPages, &state.PageOffset, &updated)
+	if err != nil {
+		return state, err
+	}
+	if err = json.Unmarshal([]byte(settings), &state.Settings); err != nil {
+		return state, err
+	}
+	state.UpdatedAt = time.Unix(0, updated).UTC()
+	return state, nil
+}
+
+// The conditional UPSERT compares event times atomically, including concurrent requests.
+// Identity survives re-indexing while keeping same-name comics in different directories separate.
+func (s *Store) UpsertComicReaderState(userID, comicID int64, state ComicReaderState) (ComicReaderState, error) {
+	settings, err := json.Marshal(state.Settings)
+	if err != nil {
+		return ComicReaderState{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ComicReaderState{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`INSERT INTO comic_reader_states
+ (user_id,mount_id,comic_path,settings,last_page,total_pages,page_offset,updated_at)
+ SELECT ?,mount_id,path,?,?,?,?,? FROM comics WHERE id=?
+ ON CONFLICT(user_id,mount_id,comic_path) DO UPDATE SET
+ settings=excluded.settings,last_page=excluded.last_page,total_pages=excluded.total_pages,
+ page_offset=excluded.page_offset,updated_at=excluded.updated_at
+ WHERE excluded.updated_at > comic_reader_states.updated_at`, userID, string(settings), state.LastPage, state.TotalPages, state.PageOffset, state.UpdatedAt.UnixNano(), comicID)
+	if err != nil {
+		return ComicReaderState{}, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return ComicReaderState{}, err
+	}
+	if count == 0 {
+		_ = tx.Rollback()
+		current, err := s.GetComicReaderState(userID, comicID)
+		if err != nil {
+			return current, err
+		}
+		return current, ErrReaderStateConflict
+	}
+
+	// Mirror only accepted events for legacy list/history views, in the same transaction.
+	stamp := state.UpdatedAt.UTC().Format(time.RFC3339Nano)
+	_, err = tx.Exec(`INSERT INTO reading_progress
+ (user_id,comic_id,comic_file_name_key,last_page,total_pages,last_read_at,updated_at)
+ SELECT ?,id,file_name_key,?,?,?,? FROM comics WHERE id=?
+ ON CONFLICT(user_id,comic_file_name_key) DO UPDATE SET
+ comic_id=excluded.comic_id,last_page=excluded.last_page,total_pages=excluded.total_pages,
+ last_read_at=excluded.last_read_at,updated_at=excluded.updated_at`, userID, state.LastPage, state.TotalPages, stamp, stamp, comicID)
+	if err != nil {
+		return ComicReaderState{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return ComicReaderState{}, err
+	}
+	return state, nil
+}
+
+func (s *Store) CountReadingHistory(userID int64) (int, error) {
+	var total int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM reading_progress rp WHERE rp.user_id=?
+ AND EXISTS(SELECT 1 FROM comics c WHERE c.file_name_key=rp.comic_file_name_key)`, userID).Scan(&total)
+	return total, err
 }

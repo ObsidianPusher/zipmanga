@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"zipmanga/internal/archiveutil"
@@ -31,7 +32,6 @@ import (
 	"zipmanga/internal/config"
 	"zipmanga/internal/db"
 	"zipmanga/internal/imgcodec"
-	"zipmanga/internal/imgenhance"
 	"zipmanga/internal/mounts"
 	"zipmanga/internal/pdfutil"
 	"zipmanga/internal/scanner"
@@ -73,6 +73,7 @@ type Server struct {
 	pageCountWarmMu   sync.Mutex
 	pageCountInFlight map[int64]struct{}
 	pageCountWarmSem  chan struct{}
+	interactiveReads  atomic.Int64
 	pageLoadMu        sync.Mutex
 	pageLoadQueues    map[string]*comicPageLoadQueue
 	pageLoadSem       chan struct{}
@@ -195,6 +196,9 @@ func (s *Server) registerRoutes() {
 	s.router.HandleFunc("GET /api/comics/{id}/cover", s.authRequired(s.handleAPIComicCover))
 	s.router.HandleFunc("GET /api/comics/{id}/file", s.authRequired(s.handleAPIComicFile))
 	s.router.HandleFunc("GET /api/comics/{id}/pages/{index}", s.authRequired(s.handleAPIComicPage))
+	s.router.HandleFunc("GET /api/comics/{id}/reader-state", s.authRequired(s.handleAPIGetReaderState))
+	s.router.HandleFunc("PUT /api/comics/{id}/reader-state", s.authRequired(s.handleAPIUpdateReaderState))
+	s.router.HandleFunc("GET /api/comics/{id}/neighbors", s.authRequired(s.handleAPIComicNeighbors))
 	s.router.HandleFunc("GET /api/comics/{id}/progress", s.authRequired(s.handleAPIGetProgress))
 	s.router.HandleFunc("POST /api/comics/{id}/progress", s.authRequired(s.handleAPIUpdateProgress))
 	s.router.HandleFunc("POST /api/comics/{id}/favorite", s.authRequired(s.handleAPIAddFavorite))
@@ -536,6 +540,9 @@ func (s *Server) handleAPIUpdateMyReaderSettings(w http.ResponseWriter, r *http.
 	}
 
 	var req struct {
+		Quality         string `json:"quality"`
+		Spread          string `json:"spread"`
+		CoverOffset     *bool  `json:"cover_offset"`
 		Mode            string `json:"mode"`
 		Fit             string `json:"fit"`
 		EnhanceZip      string `json:"enhance_zip"`
@@ -548,7 +555,12 @@ func (s *Server) handleAPIUpdateMyReaderSettings(w http.ResponseWriter, r *http.
 		return
 	}
 
+	coverOffset := true
+	if req.CoverOffset != nil {
+		coverOffset = *req.CoverOffset
+	}
 	settings := normalizeReaderSettings(db.ReaderSettings{
+		Quality: req.Quality, Spread: req.Spread, CoverOffset: coverOffset,
 		UserID:          u.ID,
 		Mode:            req.Mode,
 		Fit:             req.Fit,
@@ -1244,6 +1256,9 @@ func (s *Server) handleAPISetFavorite(w http.ResponseWriter, r *http.Request, fa
 }
 
 func (s *Server) handleAPIHistory(w http.ResponseWriter, r *http.Request) {
+	if s.handleAPIHistoryPaged(w, r) {
+		return
+	}
 	u, ok := userFromCtx(r)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
@@ -1380,122 +1395,7 @@ func (s *Server) tryServeRawArchiveCover(w http.ResponseWriter, _ *http.Request,
 const pdfRawPageRenderWidth = 1920
 
 func (s *Server) handleAPIComicPage(w http.ResponseWriter, r *http.Request) {
-	id, err := parsePathInt64(r, "id")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid comic id"})
-		return
-	}
-	pageIdx, err := parsePathInt(r, "index")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid page index"})
-		return
-	}
-
-	comic, provider, err := s.fetchComicAndProvider(id)
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Printf("warning: fetch comic/provider failed comic=%d page=%d: %v", id, pageIdx, err)
-		}
-		s.servePageFallbackImage(w, "")
-		return
-	}
-	format := comicfmt.Detect(comic.Path)
-	if !comicfmt.IsArchive(format) && format != comicfmt.FormatPDF {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported comic format"})
-		return
-	}
-	if provider.Type() == db.MountTypeWebDAV {
-		s.warmCoverForReadingAsync(comic, provider)
-	}
-	enhanceMode := normalizeEnhanceMode(r.URL.Query().Get("enhance"))
-	targetWidth := parseBoundedInt(strings.TrimSpace(r.URL.Query().Get("w")), 0, 0, 7000)
-
-	if format == comicfmt.FormatPDF {
-		if comic.PageCount <= 0 {
-			s.warmPageCountAsync(comic, provider, format)
-		}
-		if comic.PageCount > 0 && pageIdx >= comic.PageCount {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "page not found"})
-			return
-		}
-		rawPath, rawErr := s.ensureRawComicPageCache(comic, provider, format, pageIdx)
-		if rawErr != nil {
-			if s.logger != nil {
-				s.logger.Printf("warning: load pdf raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, rawErr)
-			}
-			s.servePageFallbackImage(w, comic.Title)
-			return
-		}
-		go s.prefetchComicPages(comic, provider, format, pageIdx)
-		if enhanceMode == "off" {
-			s.serveCachedPageFile(w, r, rawPath, "image/jpeg")
-			return
-		}
-		raw, readErr := os.ReadFile(rawPath)
-		if readErr != nil {
-			if s.logger != nil {
-				s.logger.Printf("warning: read pdf raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, readErr)
-			}
-			s.servePageFallbackImage(w, comic.Title)
-			return
-		}
-		enhanced, contentType, err := imgenhance.Enhance(raw, rawPath, imgenhance.Options{
-			Mode:        imgenhance.Mode(enhanceMode),
-			TargetWidth: targetWidth,
-			Source:      imgenhance.SourcePDF,
-		})
-		if err != nil {
-			if s.logger != nil {
-				s.logger.Printf("warning: enhance pdf page failed comic=%d page=%d mode=%s: %v", comic.ID, pageIdx, enhanceMode, err)
-			}
-			s.serveCachedPageFile(w, r, rawPath, "image/jpeg")
-			return
-		}
-		s.serveInlineImage(w, enhanced, contentType)
-		return
-	}
-
-	// 归档页数历史上可能被错误写小（尤其是 0/1），不做硬拦截，直接按实际页读取。
-	if comic.PageCount <= 1 {
-		warmComic := comic
-		if warmComic.PageCount > 0 {
-			warmComic.PageCount = 0
-		}
-		s.warmPageCountAsync(warmComic, provider, format)
-	}
-
-	rawPath, rawErr := s.ensureRawComicPageCache(comic, provider, format, pageIdx)
-	if rawErr != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "page not found"})
-		return
-	}
-	go s.prefetchComicPages(comic, provider, format, pageIdx)
-	if enhanceMode == "off" {
-		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
-		return
-	}
-
-	raw, readErr := os.ReadFile(rawPath)
-	if readErr != nil {
-		if s.logger != nil {
-			s.logger.Printf("warning: read archive raw page failed comic=%d page=%d: %v", comic.ID, pageIdx, readErr)
-		}
-		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
-		return
-	}
-	resized, contentType, err := imgenhance.RenderForDisplay(raw, rawPath, imgenhance.Options{
-		Mode:        imgenhance.Mode(enhanceMode),
-		TargetWidth: targetWidth,
-		Source:      imgenhance.SourceImage,
-	})
-	if err != nil {
-		if s.logger != nil {
-			s.logger.Printf("warning: render archive display page failed comic=%d page=%d mode=%s target_width=%d: %v", comic.ID, pageIdx, enhanceMode, targetWidth, err)
-		}
-		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
-		return
-	}
-	s.serveInlineImage(w, resized, contentType)
+	s.serveReaderPage(w, r)
 }
 
 func (s *Server) ensureRawComicPageCache(comic db.Comic, provider mounts.Provider, format comicfmt.Format, pageIdx int) (string, error) {
@@ -2498,6 +2398,9 @@ func userDTO(u db.User) map[string]any {
 func readerSettingsDTO(v db.ReaderSettings) map[string]any {
 	out := map[string]any{
 		"user_id":          v.UserID,
+		"quality":          v.Quality,
+		"spread":           v.Spread,
+		"cover_offset":     v.CoverOffset,
 		"mode":             v.Mode,
 		"fit":              v.Fit,
 		"enhance_zip":      v.EnhanceZip,
@@ -2754,7 +2657,7 @@ func (s *Server) maybeReleaseMemory(reason string) {
 
 func defaultReaderSettings(userID int64) db.ReaderSettings {
 	return db.ReaderSettings{
-		UserID:          userID,
+		Quality: "standard", Spread: "auto", CoverOffset: true, UserID: userID,
 		Mode:            "paged",
 		Fit:             "width",
 		EnhanceZip:      "level1",
@@ -2775,7 +2678,7 @@ func normalizeReaderSettings(v db.ReaderSettings) db.ReaderSettings {
 	}
 	fit := strings.ToLower(strings.TrimSpace(v.Fit))
 	switch fit {
-	case "width", "height":
+	case "width", "height", "contain", "original":
 		base.Fit = fit
 	}
 	base.EnhanceZip = normalizeEnhanceMode(v.EnhanceZip)
@@ -2785,6 +2688,13 @@ func normalizeReaderSettings(v db.ReaderSettings) db.ReaderSettings {
 		base.SpreadDirection = dir
 	}
 	base.MobileCompact = v.MobileCompact
+	base.CoverOffset = v.CoverOffset
+	if v.Quality == "economy" || v.Quality == "original" {
+		base.Quality = v.Quality
+	}
+	if v.Spread == "single" || v.Spread == "double" {
+		base.Spread = v.Spread
+	}
 	return base
 }
 

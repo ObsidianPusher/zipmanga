@@ -97,6 +97,9 @@ type ReadingProgress struct {
 }
 
 type ReaderSettings struct {
+	Quality         string
+	Spread          string
+	CoverOffset     bool
 	UserID          int64
 	Mode            string
 	Fit             string
@@ -149,4 +152,24 @@ type WebPArchiveManifest struct {
 	OutputSize       int64
 	CompletedAt      time.Time
 	UpdatedAt        time.Time
+}
+
+// ComicReaderPreferences belong to one user's copy of one comic.
+type ComicReaderPreferences struct {
+	MobileCompact   bool   `json:"mobileCompact"`
+	Mode            string `json:"mode"`
+	Fit             string `json:"fit"`
+	Quality         string `json:"quality"`
+	Enhance         string `json:"enhance"`
+	SpreadDirection string `json:"spreadDirection"`
+	Spread          string `json:"spread"`
+	CoverOffset     bool   `json:"coverOffset"`
+}
+
+type ComicReaderState struct {
+	Settings   ComicReaderPreferences `json:"settings"`
+	LastPage   int                    `json:"last_page"`
+	TotalPages int                    `json:"total_pages"`
+	PageOffset float64                `json:"page_offset"`
+	UpdatedAt  time.Time              `json:"updated_at"`
 }

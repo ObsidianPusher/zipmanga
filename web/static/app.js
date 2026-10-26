@@ -8,7 +8,18 @@
   const LEGACY_SETTINGS_KEY_V5 = 'zipmanga_reader_settings_v5';
   const LEGACY_SETTINGS_KEY_V4 = 'zipmanga_reader_settings_v4';
   const LIBRARY_STATE_KEY = 'zipmanga_library_state_v1';
-  const SINGLE_PAGE_READER = true;
+  const core = window.ReaderCore;
+  const imageRequests = new Map();
+  const cachedImageSources = new Map();
+  const spreadHistory = new Map();
+  let pageClickTimer = null;
+  let pendingReadingState = null;
+  let readingStateWrite = null;
+  let lastStateTimestamp = 0;
+  let lastTurnDirection = 1;
+  let zoom = 1;
+  let suppressClickUntil = 0;
+  const listRequests = {};
   const DEFAULT_LIBRARY_PAGE_SIZE = 100;
   const LIBRARY_PAGE_SIZE_OPTIONS = [50, 100, 200, 500];
   const DEFAULT_RUNTIME_SETTINGS = {
@@ -64,7 +75,10 @@
     enhance: DEFAULT_ENHANCE_MODE,
     sharpen: false,
     mobileCompact: true,
-    spreadDirection: 'rtl'
+    spreadDirection: 'rtl',
+    quality: 'standard',
+    spread: 'auto',
+    coverOffset: true
   };
 
   const state = {
@@ -86,6 +100,7 @@
       total: 0,
       totalPages: 0
     },
+    history: { page: 1, pageSize: 100, total: 0, totalPages: 0 },
     runtime: { ...DEFAULT_RUNTIME_SETTINGS },
     archiveTask: {
       items: [],
@@ -316,6 +331,11 @@
 
   function nextReaderRenderEpoch() {
     state.renderEpoch += 1;
+    for (const [key, controller] of imageRequests) {
+      controller.abort();
+      state.imageCache.delete(key);
+    }
+    imageRequests.clear();
     return state.renderEpoch;
   }
 
@@ -342,7 +362,7 @@
   function imageCacheKey(index, requestWidth = computeRequestedWidth()) {
     const enhance = getCurrentEnhanceMode();
     const formatKey = isPDFComic() ? 'pdf' : 'img';
-    return `${formatKey}:${READER_RENDER_REVISION}:${index}:${enhance}:w${requestWidth}`;
+    return `${formatKey}:${READER_RENDER_REVISION}:${index}:${state.reader.settings.quality}:${enhance}:w${requestWidth}`;
   }
 
   function canRenderPDFCoverPreviews() {
@@ -375,6 +395,7 @@
 
   function clearReaderImageCache() {
     state.imageCache.clear();
+    cachedImageSources.clear();
     state.imageObjectURLs.forEach((url) => {
       if (url) URL.revokeObjectURL(url);
     });
@@ -397,40 +418,40 @@
     });
   }
 
-  async function fetchReaderImage(url) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
-    let resp = null;
+  async function fetchReaderImage(url, controller = new AbortController()) {
+    const started = performance.now();
+    const timer = setTimeout(() => controller.abort(), 45000);
+    let objectURL;
     try {
-      resp = await fetch(url, { credentials: 'same-origin', signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (resp.status === 401) {
-      location.href = appURL('login');
-      throw new Error('unauthorized');
-    }
-    if (!resp.ok) {
-      throw new Error(`request failed: ${resp.status}`);
-    }
-    const contentType = String(resp.headers.get('content-type') || '').toLowerCase();
-    if (!contentType.startsWith('image/')) {
-      throw new Error(`unexpected content type: ${contentType}`);
-    }
-    const isFallback = resp.headers.get('x-zm-page-fallback') === '1';
-    const blob = await resp.blob();
-    if (!blob || blob.size <= 0) {
-      throw new Error('empty image blob');
-    }
-    const objectURL = URL.createObjectURL(blob);
-    try {
+      const resp = await fetch(url, {credentials: 'same-origin', signal: controller.signal});
+      if (resp.status === 401) location.href = appURL('login');
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        const err = new Error(data.error || `图片请求失败 (${resp.status})`);
+        err.status = resp.status;
+        err.code = data.code;
+        throw err;
+      }
+      if (!String(resp.headers.get('content-type') || '').startsWith('image/')) throw new Error('返回的不是图片');
+      if (resp.headers.get('x-zm-page-fallback') === '1') throw new Error('页面生成暂未完成');
+      const blob = await resp.blob();
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      objectURL = URL.createObjectURL(blob);
       const img = await loadImageFromURL(objectURL);
+      if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (img.decode) await img.decode();
       trackImageObjectURL(objectURL);
-      img.dataset.pageFallback = isFallback ? '1' : '0';
+      const ended = performance.now();
+      if (performance.getEntriesByName('reader.page.load').length >= 30) performance.clearMeasures('reader.page.load');
+      performance.measure('reader.page.load', {start:started,end:ended});
+      img.dataset.loadMs = String(Math.round(ended - started));
+      img.dataset.bytes = String(blob.size);
       return img;
     } catch (err) {
-      URL.revokeObjectURL(objectURL);
+      if (objectURL) URL.revokeObjectURL(objectURL);
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -570,7 +591,10 @@
     enhance = normalizeEnhanceMode(enhance);
     return {
       mode: v.mode === 'scroll' ? 'scroll' : 'paged',
-      fit: v.fit === 'height' ? 'height' : 'width',
+      fit: ['contain', 'height'].includes(v.fit) ? 'contain' : v.fit === 'original' ? 'original' : 'width',
+      quality: ['economy', 'original'].includes(v.quality) ? v.quality : 'standard',
+      spread: ['single', 'double'].includes(v.spread) ? v.spread : 'auto',
+      coverOffset: (v.cover_offset ?? v.coverOffset) !== false,
       enhance,
       sharpen: shouldSharpenByEnhance(enhance),
       mobileCompact: typeof v.mobile_compact === 'boolean'
@@ -602,6 +626,9 @@
     return {
       mode: state.reader.settings.mode,
       fit: state.reader.settings.fit,
+      quality: state.reader.settings.quality,
+      spread: state.reader.settings.spread,
+      cover_offset: state.reader.settings.coverOffset,
       enhance_zip: enhance,
       enhance_pdf: enhance,
       spread_direction: state.reader.settings.spreadDirection === 'ltr' ? 'ltr' : 'rtl',
@@ -617,6 +644,8 @@
     });
     if (data?.settings) {
       state.reader.settings = normalizeSettingsPayload(data.settings);
+      state.defaultsUpdatedAt = Date.parse(data.settings.updated_at) || Date.now();
+      localStorageSafeSet(`reader-defaults:${username}`, {...state.reader.settings, updated_at:new Date(state.defaultsUpdatedAt).toISOString()});
     }
   }
 
@@ -647,6 +676,9 @@
       }
     }
     clearLegacyLocalSettings();
+    const extras = localStorageSafeGet(`reader-defaults:${username}`);
+    state.defaultsUpdatedAt = Date.parse(data?.settings?.updated_at) || 0;
+    if (extras && !data?.settings?.quality) state.reader.settings = normalizeSettingsPayload({...state.reader.settings, ...extras});
   }
 
   function sleep(ms) {
@@ -687,12 +719,14 @@
           }
           const err = new Error(message);
           err.status = resp.status;
+          err.data = data;
+          err.code = data.code;
           throw err;
         }
         return data;
       } catch (err) {
         lastErr = err;
-        if (attempt < retries) {
+        if (attempt < retries && (!err.status || err.status >= 500)) {
           await sleep(220 * (attempt + 1));
           continue;
         }
@@ -1808,10 +1842,9 @@
 
   function openReader(comicID) {
     if (!comicID) return;
-    if (view === 'library') {
-      saveLibraryState(window.scrollY || 0);
-    }
-    window.open(appURL(`reader/${comicID}`), '_blank');
+    saveOutsideState();
+    try { sessionStorage.setItem(`reader-return:${username}`, location.href); } catch (_) {}
+    location.href = appURL(`reader/${comicID}`);
   }
 
   async function logout() {
@@ -1837,7 +1870,11 @@
     state.reader.pseudoFullscreen = false;
     document.body.classList.remove('fullscreen-reading');
     void destroyReaderPDF();
-    location.href = appURL('./');
+    flushReadingState(true);
+    let back;
+    try { back = sessionStorage.getItem(`reader-return:${username}`); } catch (_) {}
+    const target = back ? new URL(back, baseURL) : baseURL;
+    location.href = target.origin === location.origin && target.pathname.startsWith(baseURL.pathname) ? target.href : appURL('./');
   }
 
   function onLibraryScroll() {
@@ -2044,7 +2081,7 @@
   }
 
   async function changeLibraryPage(page, shouldScrollTop) {
-    const target = Math.max(1, Math.floor(Number(page) || 1));
+    const target = core.clampListPage(page, state.library.totalPages);
     if (target === state.library.page) return;
     state.library.page = target;
     await loadComics();
@@ -2053,7 +2090,7 @@
   }
 
   async function changeFavoritesPage(page, shouldScrollTop) {
-    const target = Math.max(1, Math.floor(Number(page) || 1));
+    const target = core.clampListPage(page, state.favorites.totalPages);
     if (target === state.favorites.page) return;
     state.favorites.page = target;
     await loadFavoriteComics();
@@ -2061,6 +2098,7 @@
   }
 
   async function loadComics() {
+    const requestID = listRequests.library = (listRequests.library || 0) + 1;
     const params = new URLSearchParams();
     if (el.searchInput && el.searchInput.value.trim()) params.set('q', el.searchInput.value.trim());
     if (el.mountFilter && el.mountFilter.value) params.set('mount_id', el.mountFilter.value);
@@ -2075,7 +2113,7 @@
     params.set('page_size', String(pageSize));
 
     const data = await fetchJSON(`api/comics?${params.toString()}`);
-    if (!data) return;
+    if (!data || requestID !== listRequests.library) return;
     state.comics = data.items || [];
     state.library.pageSize = pageSize;
 
@@ -2098,6 +2136,7 @@
       state.library.page = 1;
     }
     updateLibraryPagerUI();
+    updateOutsidePagers('library');
 
     if (el.summaryText) {
       const total = state.library.total;
@@ -2113,6 +2152,7 @@
   }
 
   async function loadFavoriteComics() {
+    const requestID = listRequests.favorites = (listRequests.favorites || 0) + 1;
     const params = new URLSearchParams();
     const pageSize = normalizeLibraryPageSize(state.favorites.pageSize);
     const page = Math.max(1, Math.floor(Number(state.favorites.page || 1)));
@@ -2125,7 +2165,7 @@
     params.set('page_size', String(pageSize));
 
     const data = await fetchJSON(`api/comics?${params.toString()}`);
-    if (!data) return;
+    if (!data || requestID !== listRequests.favorites) return;
     state.favorites.pageSize = pageSize;
     state.favorites.comics = data.items || [];
 
@@ -2147,6 +2187,7 @@
       state.favorites.page = 1;
     }
     updateFavoritesPagerUI();
+    updateOutsidePagers('favorites');
 
     if (el.favoritesSummaryText) {
       el.favoritesSummaryText.textContent = state.favorites.total
@@ -2158,8 +2199,12 @@
 
   async function loadHistory() {
     if (!el.historyGrid) return;
-    const data = await fetchJSON('api/history?limit=100');
-    if (!data) return;
+    const requestID = listRequests.history = (listRequests.history || 0) + 1;
+    const data = await fetchJSON(`api/history?page=${state.history.page}&page_size=${state.history.pageSize}`);
+    if (!data || requestID !== listRequests.history) return;
+    const pagination = data.pagination || data;
+    Object.assign(state.history, {page: pagination.page || 1, total: pagination.total || 0, totalPages: pagination.total_pages || 0});
+    updateOutsidePagers('history');
 
     const items = (data.items || []).map(it => {
       const comic = it.comic;
@@ -2224,12 +2269,14 @@
     if (el.settingsEnhance) el.settingsEnhance.value = normalizeEnhanceMode(s.enhance);
     if (el.settingsSpreadDirection) el.settingsSpreadDirection.value = s.spreadDirection;
     if (el.settingsMobileCompact) el.settingsMobileCompact.checked = s.mobileCompact;
-    syncReaderQuickButtons();
+    for (const [id, field] of Object.entries({settingsQuality:'quality',settingsSpread:'spread'})) {
+      const input=document.getElementById(id);
+      if(input) input.value=s[field];
+    }
+    const cover=document.getElementById('settingsCoverOffset');
+    if(cover) cover.checked=s.coverOffset;
   }
 
-  function syncReaderQuickButtons() {
-    // 精简阅读栏后不再维护顶部快捷模式/方向按钮。
-  }
 
   function getReaderStickyOffset() {
     if (!el.readerTopbar) return 12;
@@ -2292,10 +2339,6 @@
       el.readerSubTitle.textContent = state.reader.pageCountKnown ? `${state.reader.totalPages} 页` : '页数统计中';
     }
 
-    if (SINGLE_PAGE_READER && state.reader.settings.mode !== 'paged') {
-      state.reader.settings.mode = 'paged';
-      saveSettings();
-    }
 
     const progressParams = new URLSearchParams();
     if (detail.comic.file_name_key) {
@@ -2304,9 +2347,21 @@
     const progressURL = progressParams.size > 0
       ? `api/comics/${readerComicID}/progress?${progressParams.toString()}`
       : `api/comics/${readerComicID}/progress`;
-    const progress = await fetchJSON(progressURL);
+    const [progress, saved] = await Promise.all([
+      fetchJSON(progressURL), fetchJSON(`api/comics/${readerComicID}/reader-state`)
+    ]);
+    const local = localStorageSafeGet(readingStateKey());
+    const recovered = core.newerState(saved?.state, local);
+    if (!recovered && progress?.progress && Number(progress.progress.comic_id) !== readerComicID) progress.progress = null;
+    if (recovered) {
+      progress.progress = recovered;
+      if (recovered.settings && (Date.parse(recovered.updated_at) || 0) >= (state.defaultsUpdatedAt || 0)) state.reader.settings = normalizeSettingsPayload({...state.reader.settings, ...recovered.settings});
+      state.reader.pageOffset = Number(recovered.page_offset || 0);
+      lastStateTimestamp = Date.parse(recovered.updated_at) || 0;
+      if (local && recovered === local && (!saved?.state || Date.parse(local.updated_at) > Date.parse(saved.state.updated_at))) pendingReadingState = local;
+    }
     if (progress?.progress) {
-      state.reader.currentPage = clampPage(progress.progress.last_page || 0);
+      state.reader.currentPage = Math.max(0, Number(progress.progress.last_page || 0));
       if (!state.reader.pageCountKnown) {
         const pTotal = Math.max(0, Number(progress.progress.total_pages || 0));
         if (pTotal > 1) {
@@ -2319,11 +2374,14 @@
       }
     }
 
+    state.reader.currentPage = clampPage(state.reader.currentPage);
     syncReaderSettingsToControls();
     syncPageControls();
     updateFullscreenButton();
     syncReaderFavoriteButton();
     renderReaderByMode(false);
+    void flushReadingState();
+    void loadReaderNeighbors();
 
     if (!state.reader.pageCountKnown) {
       void refreshReaderPageCountEventually(readerComicID);
@@ -2343,30 +2401,24 @@
         const latestArchive = latestFormat === 'zip';
         const reliable = latestArchive ? pc > 1 : pc > 0;
         if (reliable) {
+          const changed = pc !== state.reader.totalPages;
           state.reader.pageCountKnown = true;
           state.reader.totalPages = pc;
           if (state.reader.comic) state.reader.comic.page_count = pc;
           if (el.readerSubTitle) el.readerSubTitle.textContent = `${pc} 页`;
           state.reader.currentPage = clampPage(state.reader.currentPage);
           syncPageControls();
+          if (changed && state.reader.settings.mode === 'scroll') renderReaderByMode(false);
           return;
         }
       } catch (_) {}
     }
   }
 
-  function requestWidthBucket() {
-    const enhance = getCurrentEnhanceMode();
-    if (enhance === ENHANCE_MODE_OFF) return 64;
-    if (enhance === ENHANCE_MODE_LEVEL2) return 32;
-    return 48;
-  }
 
   function normalizeRequestWidth(rawWidth) {
-    const bucket = requestWidthBucket();
-    const maxWidth = enhanceRenderProfile(getCurrentEnhanceMode()).requestedWidthMax;
-    const safe = Math.max(640, Math.min(maxWidth, Math.round(rawWidth || 0)));
-    return Math.max(640, Math.min(maxWidth, Math.ceil(safe / bucket) * bucket));
+    const max = state.reader.settings.quality === 'economy' ? 1600 : 3600;
+    return Math.min(max, Math.max(320, Math.ceil(rawWidth / 64) * 64));
   }
 
   function computeDisplayTargetWidth(slot = null) {
@@ -2384,90 +2436,51 @@
   }
 
   function computeRequestedWidth(slot = null) {
-    const profile = enhanceRenderProfile(getCurrentEnhanceMode());
-    const fullscreenBoost = isReaderFullscreenActive() ? 1.12 : 1;
-    const bandwidthScale = getNetworkScaleFactor();
-    const dpr = Math.max(1, Math.min(profile.dprMax || 1.6, window.devicePixelRatio || 1));
-    const raw = computeDisplayTargetWidth(slot) * profile.requestedWidthScale * dpr * fullscreenBoost * bandwidthScale;
-    return normalizeRequestWidth(raw);
+    const economy = state.reader.settings.quality === 'economy';
+    const dpr = Math.min(economy ? 1 : 3, window.devicePixelRatio || 1);
+    return normalizeRequestWidth(computeDisplayTargetWidth(slot) * dpr * zoom * (economy ? getNetworkScaleFactor() * 0.8 : 1));
   }
 
   function pageURL(index, reqWidth = computeRequestedWidth()) {
     const params = new URLSearchParams();
     params.set('enhance', getCurrentEnhanceMode());
     params.set('w', String(reqWidth));
+    params.set('quality', state.reader.settings.quality);
+    params.set('direction', lastTurnDirection < 0 ? 'backward' : 'forward');
     params.set('rv', READER_RENDER_REVISION);
     return apiURL(`api/comics/${state.reader.comic.id}/pages/${index}?${params.toString()}`);
   }
 
-  function pageURLWithFallback(index, reqWidth = computeRequestedWidth()) {
-    const primary = pageURL(index, reqWidth);
-    const fallbackWidth = normalizeRequestWidth(reqWidth * 0.82);
-    const params = new URLSearchParams();
-    params.set('enhance', getCurrentEnhanceMode());
-    params.set('w', String(Math.min(fallbackWidth, reqWidth)));
-    params.set('rv', READER_RENDER_REVISION);
-    const fallback = apiURL(`api/comics/${state.reader.comic.id}/pages/${index}?${params.toString()}`);
-    return { primary, fallback };
-  }
 
   function getImage(index, requestWidth = computeRequestedWidth()) {
     const key = imageCacheKey(index, requestWidth);
-    if (state.imageCache.has(key)) return state.imageCache.get(key);
-    const p = (async () => {
-      const urls = pageURLWithFallback(index, requestWidth);
-      const isPDF = isPDFComic();
-
-      if (!isPDF) {
-        return new Promise((resolve, reject) => {
-          const img = new Image();
-          img.decoding = 'async';
-          let triedFallback = false;
-          const cleanup = () => {
-            img.onload = null;
-            img.onerror = null;
-          };
-          img.onload = () => {
-            cleanup();
-            resolve(img);
-          };
-          img.onerror = () => {
-            if (!triedFallback) {
-              triedFallback = true;
-              img.src = urls.fallback;
-              return;
-            }
-            cleanup();
-            reject(new Error('page image load failed'));
-          };
-          img.src = urls.primary;
-        });
-      }
-
-      let serverImage = null;
-      try {
-        serverImage = await fetchReaderImage(urls.primary);
-        if (serverImage.dataset.pageFallback !== '1') return serverImage;
-      } catch (_) {}
-
-      if (!serverImage || serverImage.dataset.pageFallback === '1') {
-        try {
-          const fallbackImage = await fetchReaderImage(urls.fallback);
-          if (fallbackImage.dataset.pageFallback !== '1') return fallbackImage;
-          serverImage = fallbackImage;
-        } catch (_) {}
-      }
-
-      if (serverImage) return serverImage;
-      throw new Error('pdf page render failed');
-    })();
-
-    const wrapped = p.catch((err) => {
+    if (state.imageCache.has(key)) {
+      const cached = state.imageCache.get(key);
       state.imageCache.delete(key);
+      state.imageCache.set(key, cached);
+      return cached;
+    }
+    const controller = new AbortController();
+    imageRequests.set(key, controller);
+    const promise = fetchReaderImage(pageURL(index, requestWidth), controller).then(img => {
+      if (state.imageCache.get(key) === promise) cachedImageSources.set(key, img.src);
+      return img;
+    }).catch(err => {
+      if (state.imageCache.get(key) === promise) state.imageCache.delete(key);
       throw err;
+    }).finally(() => {
+      if (imageRequests.get(key) === controller) imageRequests.delete(key);
     });
-    state.imageCache.set(key, wrapped);
-    return wrapped;
+    state.imageCache.set(key, promise);
+    while (state.imageCache.size > 12) {
+      const oldest = state.imageCache.keys().next().value;
+      const evicted = state.imageCache.get(oldest);
+      state.imageCache.delete(oldest);
+      cachedImageSources.delete(oldest);
+      imageRequests.get(oldest)?.abort();
+      evicted.then(img => releaseReaderImage(img.src)).catch(() => {});
+    }
+    return promise;
   }
 
   function createReaderPageSlot(index) {
@@ -2501,6 +2514,9 @@
     img.addEventListener('load', () => {
       if (!isActiveReaderPageSlotRender(img, slot)) return;
       if (slot) slot.hidden = false;
+      const previousSrc = img.dataset.previousSrc;
+      delete img.dataset.previousSrc;
+      if (previousSrc) releaseReaderImage(previousSrc);
       img.hidden = false;
       img.dataset.state = 'ready';
       const error = slot?.querySelector('.reader-page-error') || null;
@@ -2552,7 +2568,11 @@
       img.style.minWidth = '';
       img.style.minHeight = '';
       img.style.imageRendering = '';
+      const previousSrc = img.getAttribute('src');
       img.removeAttribute('src');
+      delete img.dataset.baseWidth;
+      delete img.dataset.baseHeight;
+      if (previousSrc) releaseReaderImage(previousSrc);
     }
     if (error) {
       error.hidden = true;
@@ -2589,11 +2609,19 @@
       await drawPageToCanvas(pageIndex, slot, expectedEpoch);
       return true;
     } catch (err) {
-      if (err && err.staleRender) {
-        return true;
+      if (expectedEpoch !== state.renderEpoch || err.staleRender) return false;
+      if (err.code === 'page_out_of_range' && !state.reader.pageCountKnown) {
+        void refreshReaderPageCountEventually(readerComicID);
+        setReaderStatus('已到页面边界，正在核对总页数。', true);
+      } else {
+        setReaderStatus(`第 ${pageIndex + 1} 页加载失败，请重试。${navigator.onLine ? '' : '当前处于离线状态。'}`, true);
       }
-      if (expectedEpoch === state.renderEpoch) {
-        hideReaderPageSlot(slot);
+      const {img, error} = getReaderPageSlotParts(slot);
+      if (error && (!img || img.hidden || !img.src)) {
+        slot.hidden = false;
+        error.hidden = false;
+        error.textContent = '页面加载失败，点击重试';
+        error.onclick = () => {state.reader.renderedPages.delete(pageIndex); void safeDrawPage(pageIndex, slot, state.renderEpoch);};
       }
       return false;
     }
@@ -2603,20 +2631,19 @@
     while (state.scrollRenderInFlight < SCROLL_RENDER_MAX_CONCURRENT && state.scrollRenderQueue.length > 0) {
       const task = state.scrollRenderQueue.shift();
       if (!task) continue;
-      state.scrollRenderPending.delete(task.index);
       if (state.reader.renderedPages.has(task.index)) {
         continue;
       }
       state.scrollRenderInFlight += 1;
       Promise.resolve()
         .then(async () => {
-          state.reader.renderedPages.add(task.index);
-          const ok = await safeDrawPage(task.index, task.slot);
-          if (!ok) {
-            state.reader.renderedPages.delete(task.index);
-          }
+          if (task.epoch !== state.renderEpoch) return;
+          const ok = await safeDrawPage(task.index, task.slot, task.epoch);
+          if (ok && task.epoch === state.renderEpoch) state.reader.renderedPages.add(task.index);
         })
         .finally(() => {
+          if (task.epoch !== state.renderEpoch) return;
+          state.scrollRenderPending.delete(task.index);
           state.scrollRenderInFlight = Math.max(0, state.scrollRenderInFlight - 1);
           pumpScrollRenderQueue();
         });
@@ -2627,40 +2654,22 @@
     if (!slot) return;
     if (state.reader.renderedPages.has(index) || state.scrollRenderPending.has(index)) return;
     state.scrollRenderPending.add(index);
-    state.scrollRenderQueue.push({ index, slot });
+    state.scrollRenderQueue.push({ index, slot, epoch:state.renderEpoch });
     pumpScrollRenderQueue();
   }
 
-  function detectDoubleSpreadCandidates(imgA, imgB) {
-    const aPortrait = imgA.naturalHeight >= imgA.naturalWidth * 1.08;
-    const bPortrait = imgB.naturalHeight >= imgB.naturalWidth * 1.08;
-    return aPortrait && bPortrait;
-  }
 
   async function decideSpread(pageIndex) {
-    if (SINGLE_PAGE_READER) return 'single';
-    if (state.reader.settings.mode !== 'paged') return 'single';
-    if (isReaderFullscreenActive()) return 'single';
-    if (pageIndex <= 0) return 'single';
-    if (pageIndex >= state.reader.totalPages - 1) return 'single';
-
-    const stageW = el.readerStage.clientWidth;
-    const stageH = el.readerStage.clientHeight;
-    if (stageW < 1080 || stageW < stageH * 1.2) return 'single';
-
-    const rightIndex = pageIndex + 1;
-    if (rightIndex >= state.reader.totalPages) return 'single';
-
+    const prefs = state.reader.settings;
+    if (prefs.mode !== 'paged' || prefs.spread === 'single' || !state.reader.pageCountKnown) return 'single';
+    if ((prefs.coverOffset && pageIndex === 0) || pageIndex >= state.reader.totalPages - 1) return 'single';
+    if (prefs.spread !== 'double' && el.readerStage.clientWidth < 1000) return 'single';
     try {
-      const [imgA, imgB] = await Promise.all([getImage(pageIndex), getImage(rightIndex)]);
-      // Landscape pages are treated as single page.
-      const aLandscape = imgA.naturalWidth > imgA.naturalHeight * 1.02;
-      const bLandscape = imgB.naturalWidth > imgB.naturalHeight * 1.02;
-      if (aLandscape || bLandscape) return 'single';
-      return detectDoubleSpreadCandidates(imgA, imgB) ? 'double' : 'single';
-    } catch (_) {
-      return 'single';
-    }
+      const first = await getImage(pageIndex);
+      if (first.naturalWidth > first.naturalHeight) return 'single';
+      const second = await getImage(pageIndex + 1);
+      return second.naturalWidth > second.naturalHeight ? 'single' : 'double';
+    } catch (_) { return 'single'; }
   }
 
   async function drawPageToCanvas(pageIndex, slot, expectedEpoch = state.renderEpoch) {
@@ -2698,33 +2707,11 @@
     const iw = img.naturalWidth || 800;
     const ih = img.naturalHeight || 1200;
 
-    let scale;
-    if (inFullscreen) {
-      scale = Math.min(maxW / iw, maxH / ih);
-    } else {
-      const widthScale = maxW / iw;
-      const heightScale = maxH / ih;
-      if (fit === 'height') {
-        scale = heightScale;
-      } else {
-        scale = widthScale;
-        if ((widthScale * ih) > maxH * 1.01) {
-          scale = Math.min(widthScale, heightScale);
-        }
-      }
-      scale = Math.max(0.22, Math.min(scale, 2.5));
-    }
-
-    let finalW = Math.round(iw * scale);
-    let finalH = Math.round(ih * scale);
-    if (finalW > maxW) {
-      scale = maxW / iw;
-      finalW = Math.round(iw * scale);
-      finalH = Math.round(ih * scale);
-    }
-
-    finalW = Math.max(1, finalW);
-    finalH = Math.max(1, finalH);
+    maxH = Math.max(160, window.innerHeight - (inFullscreen ? 0 : getReaderStickyOffset()) - 24);
+    if (state.reader.spread === 'double') maxW = Math.max(120, (el.readerStage.clientWidth - 44) / 2);
+    const scale = core.pageScale(iw, ih, maxW, maxH, fit);
+    const finalW = Math.max(1, Math.round(iw * scale));
+    const finalH = Math.max(1, Math.round(ih * scale));
 
     const nextSrc = img.currentSrc || img.src;
     if (!nextSrc) {
@@ -2750,8 +2737,11 @@
     targetImg.style.maxHeight = 'none';
     targetImg.style.minWidth = '0';
     targetImg.style.minHeight = '0';
-    targetImg.style.width = `${finalW}px`;
-    targetImg.style.height = `${finalH}px`;
+    targetImg.dataset.baseWidth = String(finalW);
+    targetImg.dataset.baseHeight = String(finalH);
+    targetImg.style.width = `${finalW * zoom}px`;
+    targetImg.style.height = `${finalH * zoom}px`;
+    if (slot.parentElement?.classList.contains('scroll-item')) slot.parentElement.style.minHeight = `${finalH}px`;
     targetImg.style.imageRendering = 'auto';
     targetImg.dataset.pageIndex = String(pageIndex);
     targetImg.dataset.pageFallback = img.dataset.pageFallback || '0';
@@ -2767,67 +2757,50 @@
     if (currentSrc === nextSrc) {
       targetImg.removeAttribute('src');
     }
+    targetImg.dataset.previousSrc = currentSrc;
     targetImg.src = nextSrc;
   }
 
   async function renderPagedView(pageIndex) {
     const renderEpoch = nextReaderRenderEpoch();
-    if (state.reader.totalPages <= 0) {
-      state.reader.spread = 'single';
-      if (el.readerStage) el.readerStage.dataset.spread = 'single';
-      hideReaderPageSlot(el.pagedSlotLeft);
-      hideReaderPageSlot(el.pagedSlotRight);
-      updateReaderProgressText();
-      return;
-    }
-
-    let page = clampPage(pageIndex);
-    state.reader.currentPage = page;
-    if (el.readerStage) el.readerStage.dataset.spread = 'single';
-    hideReaderPageSlot(el.pagedSlotRight);
-    if (!state.reader.pageCountKnown) {
-      state.reader.totalPages = Math.max(state.reader.totalPages, page + 1);
-    }
-
-    state.reader.spread = await decideSpread(page);
+    const page = clampPage(pageIndex);
+    const previousPage = state.reader.displayedPage ?? state.reader.currentPage;
+    setReaderStatus(`正在加载第 ${page + 1} 页…`);
+    const spread = await decideSpread(page);
     if (renderEpoch !== state.renderEpoch) return;
-    el.readerStage.dataset.spread = state.reader.spread;
-
-    let mainPageOK = true;
-    if (state.reader.spread === 'double') {
-      if (el.pagedSlotRight) el.pagedSlotRight.hidden = false;
-      if (isRTL()) {
-        // Right-open: current page at right side, next page at left side.
-        await safeDrawPage(page + 1, el.pagedSlotLeft, renderEpoch);
-        if (renderEpoch !== state.renderEpoch) return;
-        mainPageOK = await safeDrawPage(page, el.pagedSlotRight, renderEpoch);
-      } else {
-        mainPageOK = await safeDrawPage(page, el.pagedSlotLeft, renderEpoch);
-        if (renderEpoch !== state.renderEpoch) return;
-        await safeDrawPage(page + 1, el.pagedSlotRight, renderEpoch);
-      }
-    } else {
-      mainPageOK = await safeDrawPage(page, el.pagedSlotLeft, renderEpoch);
-      hideReaderPageSlot(el.pagedSlotRight);
-    }
+    state.reader.spread = spread;
+    el.readerStage.dataset.spread = spread;
+    const primary = spread === 'double' && isRTL() ? el.pagedSlotRight : el.pagedSlotLeft;
+    const ok = await safeDrawPage(page, primary, renderEpoch);
     if (renderEpoch !== state.renderEpoch) return;
-
-    if (!mainPageOK && !state.reader.pageCountKnown && page > 0) {
-      const discovered = Math.max(1, page);
-      state.reader.pageCountKnown = true;
-      state.reader.totalPages = discovered;
-      if (state.reader.comic) state.reader.comic.page_count = discovered;
-      if (el.readerSubTitle) el.readerSubTitle.textContent = `${discovered} 页`;
-      const rollback = clampPage(page - 1);
+    if (!ok) {
+      state.reader.currentPage = previousPage;
       syncPageControls();
-      if (rollback !== page) {
-        await renderPagedView(rollback);
-      }
+      state.reader.retryPage = page;
       return;
     }
-
+    const secondOK = spread !== 'double' || await safeDrawPage(page + 1, isRTL() ? el.pagedSlotLeft : el.pagedSlotRight, renderEpoch);
+    if (spread !== 'double') hideReaderPageSlot(el.pagedSlotRight);
+    if (!secondOK) {
+      state.reader.spread = 'single';
+      state.reader.retryPage = page;
+    }
+    if (renderEpoch !== state.renderEpoch) return;
+    state.reader.currentPage = page;
+    state.reader.displayedPage = page;
+    if (secondOK) state.reader.retryPage = null;
+    spreadHistory.set(page, secondOK && spread === 'double' ? 2 : 1);
+    if (!state.reader.pageCountKnown) state.reader.totalPages = Math.max(state.reader.totalPages, page + 1);
     updateReaderProgressText();
+    syncPageControls();
     scheduleSaveProgress();
+    if (secondOK) setReaderStatus('');
+    updateReaderEnd();
+    const offsets = [lastTurnDirection * (spread === 'double' ? 2 : 1), -lastTurnDirection];
+    for (const offset of offsets) {
+      const index = page + offset;
+      if (index >= 0 && (!state.reader.pageCountKnown || index < state.reader.totalPages)) void getImage(index).catch(() => {});
+    }
   }
 
   function renderScrollScaffold(preservePosition) {
@@ -2849,6 +2822,7 @@
       const item = document.createElement('article');
       item.className = 'scroll-item';
       item.dataset.index = String(i);
+      item.style.minHeight = `${Math.round(computeDisplayTargetWidth() * 1.45)}px`;
       const slot = createReaderPageSlot(i);
       slot.dataset.index = String(i);
       item.appendChild(slot);
@@ -2866,6 +2840,13 @@
           if (slot) {
             enqueueScrollRender(index, slot);
           }
+        } else if (Math.abs(index - state.reader.currentPage) > 3) {
+          const slot = item.querySelector('.reader-page-slot');
+          if (slot) {
+            item.style.minHeight = `${Math.max(item.offsetHeight, 96)}px`;
+            hideReaderPageSlot(slot);
+            state.reader.renderedPages.delete(index);
+          }
         }
       });
     }, { root: null, rootMargin: '900px 0px 900px 0px' });
@@ -2874,7 +2855,7 @@
 
     const target = el.readerPages.querySelector(`.scroll-item[data-index="${state.reader.currentPage}"]`);
     if (target && !preservePosition) {
-      setTimeout(() => scrollToReaderItem(target, 'auto'), 50);
+      setTimeout(() => {scrollToReaderItem(target, 'auto'); if (state.reader.pageOffset) window.scrollBy(0, target.offsetHeight * state.reader.pageOffset);}, 50);
     }
 
     if (!state.windowScrollBound) {
@@ -2894,7 +2875,13 @@
   }
 
   function updateCurrentPageByScroll() {
-    const items = el.readerPages.querySelectorAll('.scroll-item');
+    const allItems = [...el.readerPages.children];
+    let low = 0, high = allItems.length - 1;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (allItems[mid].getBoundingClientRect().bottom < getReaderStickyOffset() + 20) low = mid + 1; else high = mid;
+    }
+    const items = allItems.slice(Math.max(0, low - 1), Math.min(allItems.length, low + 4));
     if (!items.length) return;
 
     const anchor = Math.max(getReaderStickyOffset() + 20, Math.round(window.innerHeight * 0.4));
@@ -2917,26 +2904,36 @@
       }
     });
 
+    const currentItem = allItems[best];
+    if (currentItem) state.reader.pageOffset = Math.max(0, Math.min(1, (getReaderStickyOffset() - currentItem.getBoundingClientRect().top) / Math.max(1,currentItem.offsetHeight)));
+    for (const index of [...state.reader.renderedPages]) {
+      if (Math.abs(index-best) > 3) {
+        const item=allItems[index];
+        if(item) {item.style.minHeight=`${item.offsetHeight}px`;hideReaderPageSlot(item.querySelector('.reader-page-slot'));}
+        state.reader.renderedPages.delete(index);
+      }
+    }
     if (best !== state.reader.currentPage) {
       state.reader.currentPage = best;
       updateReaderProgressText();
-      scheduleSaveProgress();
+      updateReaderEnd();
     }
+    if (state.reader.renderedPages.has(best)) scheduleSaveProgress();
   }
 
   function renderReaderByMode(preservePosition) {
     if (!state.reader.comic) return;
-    nextReaderRenderEpoch();
-    if (SINGLE_PAGE_READER && state.reader.settings.mode !== 'paged') {
-      state.reader.settings.mode = 'paged';
-      saveSettings();
+    if (state.reader.settings.mode === 'scroll' && preservePosition && state.scrollObserver && el.readerPages.childElementCount === state.reader.totalPages) {
+      updateCurrentPageByScroll();
+      return;
     }
+    nextReaderRenderEpoch();
     if (el.readerStage) {
       el.readerStage.dataset.fit = state.reader.settings.mode === 'scroll' ? 'width' : state.reader.settings.fit;
     }
-    syncReaderQuickButtons();
 
     if (state.reader.settings.mode === 'scroll') {
+      state.reader.spread = 'single';
       hideReaderPageSlot(el.pagedSlotLeft);
       hideReaderPageSlot(el.pagedSlotRight);
       el.readerPagedWrap.hidden = true;
@@ -2985,27 +2982,19 @@
 
   function scheduleSaveProgress() {
     if (!state.reader.comic) return;
-    const page = state.reader.currentPage;
-    if (state.reader.lastSavedPage === page) return;
+    const item = el.readerPages?.querySelector(`.scroll-item[data-index="${state.reader.currentPage}"]`);
+    const pageOffset = state.reader.settings.mode === 'scroll' && item ? Math.max(0, Math.min(1, (getReaderStickyOffset() - item.getBoundingClientRect().top) / Math.max(1, item.offsetHeight))) : 0;
+    lastStateTimestamp = Math.max(Date.now(), lastStateTimestamp + 1);
+    pendingReadingState = {
+      last_page: state.reader.currentPage,
+      total_pages: Math.max(state.reader.totalPages, state.reader.currentPage + 1),
+      page_offset: pageOffset,
+      settings: Object.fromEntries(['mode','fit','quality','enhance','spreadDirection','spread','coverOffset','mobileCompact'].map(key => [key,state.reader.settings[key]])),
+      updated_at: new Date(lastStateTimestamp).toISOString()
+    };
+    localStorageSafeSet(readingStateKey(), pendingReadingState);
     if (state.reader.saveTimer) clearTimeout(state.reader.saveTimer);
-
-    state.reader.saveTimer = setTimeout(async () => {
-      try {
-        const totalPages = state.reader.pageCountKnown
-          ? state.reader.totalPages
-          : Math.max(state.reader.totalPages, page + 1);
-        await fetchJSON(`api/comics/${state.reader.comic.id}/progress`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            last_page: page,
-            total_pages: totalPages,
-            comic_file_name_key: String(state.reader.comic.file_name_key || '')
-          })
-        });
-        state.reader.lastSavedPage = page;
-      } catch (_) {}
-    }, 260);
+    state.reader.saveTimer = setTimeout(() => {state.reader.saveTimer = null; void flushReadingState();}, 300);
   }
 
   function jumpToPage(page1Based) {
@@ -3023,16 +3012,24 @@
   }
 
   function pagedStep() {
-    return 1;
+    return state.reader.spread === 'double' ? 2 : 1;
   }
 
   function movePages(delta) {
-    const next = clampPage(state.reader.currentPage + delta);
+    if (zoom > 1) return;
+    lastTurnDirection = Math.sign(delta) || 1;
+    const double = state.reader.spread === 'double' || (state.reader.currentPage === 0 && state.reader.settings.coverOffset && state.reader.settings.spread === 'double');
+    let next = core.turnPage(state.reader.currentPage, Math.sign(delta), state.reader.pageCountKnown ? state.reader.totalPages : state.reader.currentPage + 3, double, state.reader.settings.coverOffset);
+    if (delta < 0 && state.reader.settings.spread !== 'single') {
+      const previous = [...spreadHistory.entries()].filter(([start,count]) => start < state.reader.currentPage && start + count === state.reader.currentPage).map(([start]) => start);
+      if (previous.length) next = Math.max(...previous);
+      else if (state.reader.settings.spread === 'double') next = core.turnPage(state.reader.currentPage,-1,state.reader.totalPages,true,state.reader.settings.coverOffset);
+    }
     jumpToPage(next + 1);
   }
 
   function logicalDeltaToRaw(delta) {
-    return delta;
+    return isRTL() ? -delta : delta;
   }
 
   function isMobileViewport() {
@@ -3058,6 +3055,7 @@
   function popReaderFullscreenHistoryIfNeeded() {
     if (!state.reader.fullscreenHistoryPushed) return;
     if (history.state && history.state.readerFullscreen) {
+      clearReaderFullscreenHistoryState();
       history.back();
       return;
     }
@@ -3071,12 +3069,7 @@
   }
 
   async function lockPortraitOnMobileIfPossible() {
-    if (!isMobileViewport()) return;
-    const orientation = window.screen && window.screen.orientation;
-    if (!orientation || typeof orientation.lock !== 'function') return;
-    try {
-      await orientation.lock('portrait');
-    } catch (_) {}
+    // Let the device follow the reader's chosen orientation.
   }
 
   function unlockOrientationIfPossible() {
@@ -3089,36 +3082,54 @@
 
   function bindSwipeGesture() {
     if (!el.readerStage) return;
-
-    el.readerStage.addEventListener('pointerdown', (e) => {
-      if (view !== 'reader') return;
-      if (state.reader.settings.mode !== 'paged') return;
-      if (e.pointerType === 'mouse' && e.button !== 0) return;
-      if (e.target.closest && e.target.closest('.reader-side')) return;
-      swipeState = { x: e.clientX, y: e.clientY, t: performance.now() };
-    });
-
-    el.readerStage.addEventListener('pointerup', (e) => {
-      if (!swipeState) return;
-      const dx = e.clientX - swipeState.x;
-      const dy = e.clientY - swipeState.y;
-      const dt = performance.now() - swipeState.t;
-      swipeState = null;
-
-      if (Math.abs(dx) < 56) return;
-      if (Math.abs(dx) < Math.abs(dy) * 1.2) return;
-      if (dt > 800) return;
-
-      const step = pagedStep();
-      if (dx < 0) {
-        movePages(logicalDeltaToRaw(step));
-      } else {
-        movePages(logicalDeltaToRaw(-step));
+    const pointers = new Map();
+    let pinchDistance = 0, pinchZoom = 1;
+    const wrap = el.readerStage;
+    el.readerStage.addEventListener('pointerdown', e => {
+      if (e.target.closest('button, a, input, select, details')) return;
+      pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+      if (pointers.size === 1) swipeState = {x:e.clientX, y:e.clientY, t:performance.now(), left:wrap.scrollLeft, top:wrap.scrollTop};
+      if (pointers.size === 2) {
+        const [a,b] = [...pointers.values()];
+        pinchDistance = Math.hypot(a.x-b.x, a.y-b.y);
+        pinchZoom = zoom;
+        swipeState = null;
+        suppressClickUntil = performance.now() + 600;
       }
+      if (zoom > 1 || pointers.size > 1) el.readerStage.setPointerCapture(e.pointerId);
     });
-
-    el.readerStage.addEventListener('pointercancel', () => {
+    el.readerStage.addEventListener('pointermove', e => {
+      if (!pointers.has(e.pointerId)) return;
+      pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+      if (pointers.size === 2 && pinchDistance) {
+        const [a,b] = [...pointers.values()];
+        setReaderZoom(pinchZoom * Math.hypot(a.x-b.x, a.y-b.y) / pinchDistance, false);
+        e.preventDefault();
+      } else if (zoom > 1 && swipeState) {
+        wrap.scrollLeft = swipeState.left + swipeState.x - e.clientX;
+        wrap.scrollTop = swipeState.top + swipeState.y - e.clientY;
+        suppressClickUntil = performance.now() + 600;
+      }
+    }, {passive:false});
+    const finish = e => {
+      const start = swipeState;
+      pointers.delete(e.pointerId);
       swipeState = null;
+      if (pinchDistance) {pinchDistance = 0; refreshZoomResolution(); return;}
+      if (!start || zoom > 1 || state.reader.settings.mode !== 'paged' || e.type === 'pointercancel') return;
+      const dx = e.clientX - start.x, dy = e.clientY - start.y;
+      if (Math.abs(dx) >= 56 && Math.abs(dx) > Math.abs(dy)*1.2 && performance.now()-start.t < 800) {
+        suppressClickUntil = performance.now() + 600;
+        movePages(logicalDeltaToRaw(dx < 0 ? 1 : -1));
+      }
+    };
+    el.readerStage.addEventListener('pointerup', finish);
+    el.readerStage.addEventListener('pointercancel', finish);
+    el.readerStage.addEventListener('dblclick', e => {
+      if (e.target.closest('button, a, input, select')) return;
+      clearTimeout(pageClickTimer);
+      suppressClickUntil = performance.now() + 600;
+      setReaderZoom(zoom > 1 ? 1 : 2);
     });
   }
 
@@ -3139,8 +3150,7 @@
       await document.exitFullscreen();
       return;
     } else {
-      await el.readerStage.requestFullscreen();
-      pushReaderFullscreenHistoryState();
+      await el.viewReader.requestFullscreen();
     }
     updateFullscreenButton();
     renderReaderByMode(true);
@@ -3152,7 +3162,11 @@
   }
 
   function bindReaderControls() {
-    if (el.pageSlider) el.pageSlider.addEventListener('input', () => jumpToPage(el.pageSlider.value));
+    if (el.pageSlider) {
+      el.pageSlider.addEventListener('input', () => setReaderStatus(`跳至第 ${el.pageSlider.value} 页（松开确认）`));
+      el.pageSlider.addEventListener('change', () => jumpToPage(el.pageSlider.value));
+    }
+    bindReaderPreferences();
 
     if (el.readerFavoriteBtn) {
       el.readerFavoriteBtn.addEventListener('click', async () => {
@@ -3186,21 +3200,23 @@
     if (el.readerPagedWrap) {
       el.readerPagedWrap.addEventListener('click', (e) => {
         if (view !== 'reader') return;
-        if (state.reader.settings.mode !== 'paged') return;
+        if (state.reader.settings.mode !== 'paged' || zoom > 1 || performance.now() < suppressClickUntil || e.detail > 1) return;
         if (e.target.closest && e.target.closest('.reader-topbar')) return;
+        clearTimeout(pageClickTimer);
         const rect = el.readerPagedWrap.getBoundingClientRect();
         const x = e.clientX - rect.left;
-        const step = pagedStep();
-        if (x < rect.width * 0.4) {
-          movePages(logicalDeltaToRaw(-step));
-        } else if (x > rect.width * 0.6) {
-          movePages(logicalDeltaToRaw(step));
-        }
+        pageClickTimer = setTimeout(() => {
+          if (performance.now() < suppressClickUntil || zoom > 1) return;
+          const step = pagedStep();
+          if (x < rect.width * 0.4) movePages(logicalDeltaToRaw(-step));
+          else if (x > rect.width * 0.6) movePages(logicalDeltaToRaw(step));
+
+        }, 250);
       });
     }
 
     window.addEventListener('keydown', (e) => {
-      if (view !== 'reader') return;
+      if (view !== 'reader' || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input, select, textarea, button, [contenteditable]')) return;
       const key = String(e?.key || '');
       if (e.key === 'ArrowLeft') {
         e.preventDefault();
@@ -3265,6 +3281,7 @@
           renderReaderByMode(true);
         } else {
           updateCurrentPageByScroll();
+          renderReaderByMode(false);
         }
       }, 120);
     });
@@ -3280,7 +3297,10 @@
     el.settingsForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       state.reader.settings.mode = el.settingsMode.value === 'scroll' ? 'scroll' : 'paged';
-      state.reader.settings.fit = el.settingsFit.value === 'height' ? 'height' : 'width';
+      state.reader.settings.fit = ['contain','original'].includes(el.settingsFit.value) ? el.settingsFit.value : 'width';
+      state.reader.settings.quality = document.getElementById('settingsQuality').value;
+      state.reader.settings.spread = document.getElementById('settingsSpread').value;
+      state.reader.settings.coverOffset = document.getElementById('settingsCoverOffset').checked;
       state.reader.settings.enhance = normalizeEnhanceMode(el.settingsEnhance?.value);
       state.reader.settings.spreadDirection = el.settingsSpreadDirection.value === 'ltr' ? 'ltr' : 'rtl';
       state.reader.settings.sharpen = shouldSharpenByEnhance(getCurrentEnhanceMode());
@@ -3850,6 +3870,230 @@
     el.scanStatusText.textContent = '';
   }
 
+  function localStorageSafeGet(key) {
+    try {return JSON.parse(localStorage.getItem(key) || 'null');} catch (_) {return null;}
+  }
+
+  function localStorageSafeSet(key, value) {
+    try {localStorage.setItem(key, JSON.stringify(value));} catch (_) {}
+  }
+
+  function readingStateKey() {
+    const comic = state.reader.comic;
+    return `reader-state:${username}:${comic?.mount_id}:${comic?.path || comic?.id}`;
+  }
+
+  async function flushReadingState(keepalive = false) {
+    if (!pendingReadingState || !state.reader.comic) return;
+    if (readingStateWrite && !keepalive) return readingStateWrite;
+    const snapshot = pendingReadingState;
+    const url = `api/comics/${state.reader.comic.id}/reader-state`;
+    const write = (async () => {
+      try {
+        const resp = await fetch(appURL(url), {
+          method:'PUT', credentials:'same-origin', keepalive,
+          headers:{'Content-Type':'application/json'}, body:JSON.stringify(snapshot)
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 409) {
+          if (pendingReadingState === snapshot) {
+            pendingReadingState = null;
+            localStorageSafeSet(readingStateKey(), data.state);
+            lastStateTimestamp = Math.max(lastStateTimestamp, Date.parse(data.state?.updated_at) || 0);
+            setReaderStatus('另一设备保存了更新的进度，重新打开可恢复。');
+          }
+        } else if (resp.ok && pendingReadingState === snapshot) {
+          pendingReadingState = null;
+          state.reader.lastSavedPage = snapshot.last_page;
+        } else if (!resp.ok) throw new Error(data.error || '进度同步失败');
+      } catch (_) {
+        if (!keepalive) setReaderStatus('进度已保存在本机，联网后自动同步。');
+      }
+    })();
+    readingStateWrite = write;
+    await write;
+    if (readingStateWrite === write) readingStateWrite = null;
+    if (!keepalive && pendingReadingState && pendingReadingState !== snapshot) void flushReadingState();
+  }
+
+  function setReaderStatus(message, retry = false) {
+    const status = document.getElementById('readerStatus');
+    if (status) status.textContent = message;
+    const button = document.getElementById('readerRetryBtn');
+    if (button) button.hidden = !retry;
+  }
+
+  function releaseReaderImage(src) {
+    if (!src || !state.imageObjectURLs.has(src) || [...cachedImageSources.values()].includes(src)) return;
+    const visible = [...document.querySelectorAll('.reader-page-media')].some(img => img.getAttribute('src') === src);
+    if (!visible) {
+      URL.revokeObjectURL(src);
+      state.imageObjectURLs.delete(src);
+    }
+  }
+
+  function saveOutsideState() {
+    if (!['library','favorites','history'].includes(view)) return;
+    if (view === 'library') saveLibraryState(window.scrollY || 0);
+    const filters = {};
+    for (const id of ['searchInput','mountFilter','statusFilter','folderFilter','sortRule','favoritesMountFilter','favoritesFolderFilter']) {
+      const input = document.getElementById(id);
+      if (input) filters[id] = input.value;
+    }
+    localStorageSafeSet(`list-state:${username}:${view}`, {page:state[view].page, pageSize:state[view].pageSize, filters, scrollY:window.scrollY});
+  }
+
+  function restoreOutsideState() {
+    const saved = localStorageSafeGet(`list-state:${username}:${view}`);
+    if (!saved) return;
+    state[view].page = Math.max(1, Number(saved.page) || 1);
+    state[view].pageSize = normalizeLibraryPageSize(saved.pageSize);
+    for (const [id, value] of Object.entries(saved.filters || {})) {
+      const input = document.getElementById(id);
+      if (input) {
+        input.value = value;
+        if (input.value !== value) input.dataset.pendingValue = value;
+      }
+    }
+    state[view].restoreScroll = Math.max(0, Number(saved.scrollY) || 0);
+  }
+
+  function updateOutsidePagers(kind) {
+    const list = state[kind];
+    for (const pager of document.querySelectorAll(`[data-list-pager="${kind}"]`)) {
+      pager.querySelector('[data-page-label]').textContent = `第 ${list.page} / ${Math.max(1,list.totalPages)} 页 · 共 ${list.total} 本`;
+      pager.querySelector('[data-page-action="prev"]').disabled = list.page <= 1;
+      pager.querySelector('[data-page-action="next"]').disabled = list.page >= list.totalPages;
+      const input = pager.querySelector('[data-page-input]');
+      input.max = String(Math.max(1,list.totalPages));
+      input.value = String(list.page);
+      input.disabled = list.totalPages <= 1;
+      pager.querySelector('[data-page-action="jump"]').disabled = list.totalPages <= 1;
+    }
+    if (list.restoreScroll != null) {
+      const target = list.restoreScroll;
+      delete list.restoreScroll;
+      requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0,target)));
+    }
+  }
+
+  function bindOutsidePagers() {
+    for (const pager of document.querySelectorAll('[data-list-pager]')) {
+      const kind = pager.dataset.listPager;
+      const jump = async action => {
+        const list = state[kind];
+        const value = action === 'prev' ? list.page-1 : action === 'next' ? list.page+1 : pager.querySelector('[data-page-input]').value;
+        const target = core.clampListPage(value,list.totalPages);
+        if (target === list.page) return;
+        pager.setAttribute('aria-busy','true');
+        try {
+          if (kind === 'library') await changeLibraryPage(target,true);
+          else if (kind === 'favorites') await changeFavoritesPage(target,true);
+          else {list.page=target; await loadHistory(); window.scrollTo(0,0);}
+          saveOutsideState();
+        } catch (err) {alert(`翻页失败：${err.message}`);} finally {pager.removeAttribute('aria-busy');}
+      };
+      pager.addEventListener('click', e => {
+        const button = e.target.closest('[data-page-action]');
+        if (button && !button.disabled) void jump(button.dataset.pageAction);
+      });
+      pager.querySelector('[data-page-input]').addEventListener('keydown', e => {if(e.key === 'Enter') {e.preventDefault(); void jump('jump');}});
+    }
+  }
+
+  async function loadReaderNeighbors() {
+    try {
+      state.reader.neighbors = await fetchJSON(`api/comics/${readerComicID}/neighbors`);
+      updateReaderEnd();
+    } catch (_) {}
+  }
+
+  function updateReaderEnd() {
+    const panel = document.getElementById('readerEndPanel');
+    if (!panel) return;
+    panel.hidden = !state.reader.pageCountKnown || state.reader.currentPage + (state.reader.spread === 'double' ? 2 : 1) < state.reader.totalPages;
+    const next = document.getElementById('readerNextBook');
+    const comic = state.reader.neighbors?.next;
+    if (next) {
+      next.hidden = !comic;
+      if (comic) {next.href = appURL(`reader/${comic.id}`); next.textContent = `下一册：${comic.title}`;}
+    }
+  }
+
+  let zoomRefreshTimer = null;
+  function setReaderZoom(value, refresh = true) {
+    zoom = Math.max(1,Math.min(4,value));
+    el.readerStage.dataset.zoomed = String(zoom > 1);
+    for (const img of el.readerPagedWrap.querySelectorAll('.reader-page-media')) {
+      if (!img.dataset.baseWidth) {img.dataset.baseWidth=parseFloat(img.style.width)||img.width; img.dataset.baseHeight=parseFloat(img.style.height)||img.height;}
+      img.style.width = `${Number(img.dataset.baseWidth)*zoom}px`;
+      img.style.height = `${Number(img.dataset.baseHeight)*zoom}px`;
+    }
+    const reset = document.getElementById('readerZoomResetBtn');
+    if(reset) reset.textContent = `${Math.round(zoom*100)}%`;
+    if(refresh) refreshZoomResolution();
+  }
+
+  function refreshZoomResolution() {
+    clearTimeout(zoomRefreshTimer);
+    zoomRefreshTimer=setTimeout(() => {
+      if (state.reader.settings.mode !== 'paged') return;
+      const epoch=state.renderEpoch;
+      const indices = state.reader.spread === 'double' ? [state.reader.currentPage,state.reader.currentPage+1] : [state.reader.currentPage];
+      indices.forEach(index => {
+        const slot = [...el.readerPagedWrap.querySelectorAll('.reader-page-slot')].find(item => item.querySelector('img')?.dataset.pageIndex === String(index));
+        if (!slot) return;
+        getImage(index,computeRequestedWidth(slot)).then(img => {
+          if(epoch !== state.renderEpoch) return;
+          slot.querySelector('img').src=img.src;
+        }).catch(()=>{});
+      });
+    },200);
+  }
+
+  function bindReaderPreferences() {
+    document.getElementById('readerRetryBtn')?.addEventListener('click',()=> {
+      const page = state.reader.retryPage ?? state.reader.currentPage;
+      if (state.reader.settings.mode === 'paged') void renderPagedView(page);
+      else {state.reader.renderedPages.delete(page); const slot=el.readerPages.querySelector(`[data-index="${page}"] .reader-page-slot`); if(slot) void safeDrawPage(page,slot);}
+    });
+    document.getElementById('readerZoomInBtn')?.addEventListener('click',()=>setReaderZoom(zoom+.25));
+    document.getElementById('readerZoomOutBtn')?.addEventListener('click',()=>setReaderZoom(zoom-.25));
+    document.getElementById('readerZoomResetBtn')?.addEventListener('click',()=>setReaderZoom(1));
+    document.getElementById('readerThumbnailsBtn')?.addEventListener('click',showReaderThumbnails);
+  }
+
+  let thumbnailObserver = null;
+  function showReaderThumbnails() {
+    const panel = document.getElementById('readerThumbnails');
+    if (!panel) return;
+    panel.hidden = !panel.hidden;
+    document.getElementById('readerThumbnailsBtn')?.setAttribute('aria-expanded',String(!panel.hidden));
+    if (panel.hidden) return;
+    if (thumbnailObserver) thumbnailObserver.disconnect();
+    panel.replaceChildren();
+    thumbnailObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) if(entry.isIntersecting) {
+        const image=entry.target;
+        const thumbURL=new URL(pageURL(Number(image.dataset.page),320));
+        thumbURL.searchParams.set('quality','economy');
+        thumbURL.searchParams.set('enhance','off');
+        image.src=thumbURL.href;
+        thumbnailObserver.unobserve(image);
+      }
+    },{root:panel,rootMargin:'200px'});
+    for(let index=0;index<state.reader.totalPages;index++) {
+      const button=document.createElement('button'); button.type='button';
+      button.setAttribute('aria-label',`第 ${index+1} 页`);
+      if(index===state.reader.currentPage)button.setAttribute('aria-current','page');
+      const image=document.createElement('img'); image.alt=''; image.dataset.page=String(index); image.loading='lazy';
+      const label=document.createElement('span'); label.textContent=String(index+1);
+      button.append(image,label);
+      button.addEventListener('click',()=>{panel.hidden=true;document.getElementById('readerThumbnailsBtn')?.setAttribute('aria-expanded','false');jumpToPage(index+1);});
+      panel.append(button); thumbnailObserver.observe(image);
+    }
+  }
+
   function bindCommonEvents() {
     if (el.logoutBtn) el.logoutBtn.addEventListener('click', logout);
   }
@@ -3861,6 +4105,7 @@
     }
     await loadMounts();
     restoreLibraryState();
+    restoreOutsideState();
     await loadComicFolderOptions(el.folderFilter, el.mountFilter ? el.mountFilter.value : '', {});
     updateLibraryPagerUI();
     await loadComics();
@@ -3944,11 +4189,13 @@
 
   async function initHistory() {
     showView('history');
+    restoreOutsideState();
     await loadHistory();
   }
 
   async function initFavorites() {
     showView('favorites');
+    restoreOutsideState();
     if (el.favoritesPageSize) {
       el.favoritesPageSize.value = String(normalizeLibraryPageSize(state.favorites.pageSize));
     }
@@ -4206,11 +4453,12 @@
   async function init() {
     if (el.userBadge) el.userBadge.textContent = `${username}${isAdmin ? ' (admin)' : ''}`;
     try {
-      await loadSettingsFromServer();
+      if (view === 'reader' || view === 'settings') await loadSettingsFromServer();
     } catch (_) {
       state.reader.settings = cloneDefaultSettings();
     }
     bindCommonEvents();
+    bindOutsidePagers();
 
     try {
       if (view === 'reader') {
@@ -4234,6 +4482,9 @@
   let appCleanedUp = false;
 
   function cleanupAppResources() {
+    saveOutsideState();
+    if (view === 'reader' && state.reader.settings.mode === 'scroll' && state.reader.renderedPages.has(state.reader.currentPage)) scheduleSaveProgress();
+    flushReadingState(true);
     if (appCleanedUp) return;
     appCleanedUp = true;
     if (scanTimer) clearInterval(scanTimer);
@@ -4256,5 +4507,10 @@
     void destroyReaderPDF();
   }
 
-  window.addEventListener('pagehide', cleanupAppResources, { capture: true });
+  window.addEventListener('pagehide', event => {
+    if (event.persisted) {saveOutsideState(); flushReadingState(true); return;}
+    cleanupAppResources();
+  }, {capture:true});
+  document.addEventListener('visibilitychange', () => {if (document.visibilityState === 'hidden') {saveOutsideState(); if(view === 'reader' && state.reader.settings.mode === 'scroll' && state.reader.renderedPages.has(state.reader.currentPage)) scheduleSaveProgress(); flushReadingState(true);}});
+  window.addEventListener('online', () => void flushReadingState());
 })();

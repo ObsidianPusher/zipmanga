@@ -180,6 +180,19 @@ func TestCleanupOldHistoryKeepsLatestHundred(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
+	// Pagination must retain older history until cleanup is explicitly requested.
+	total, err := store.CountReadingHistory(user.ID)
+	if err != nil || total != 101 {
+		t.Fatalf("retained history=%d err=%v", total, err)
+	}
+	tail, err := store.ListReadingHistory(user.ID, 100, 100)
+	if err != nil || len(tail) != 1 || tail[0].Comic.FileNameKey != "series-001.zip" {
+		t.Fatalf("second history page=%v err=%v", tail, err)
+	}
+	if err := store.CleanupOldHistory(user.ID, 100); err != nil {
+		t.Fatal(err)
+	}
+
 	var progressCount int
 	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM reading_progress WHERE user_id = ?`, user.ID).Scan(&progressCount); err != nil {
 		t.Fatalf("count reading_progress failed: %v", err)

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{.Title}}</title>
   <base href="{{.BaseHref}}" />
-  <link rel="stylesheet" href="static/styles.css?v=20260801r7" />
+  <link rel="stylesheet" href="static/styles.css?v=20261020r10" />
 </head>
 <body class="app-page" data-username="{{.Username}}" data-is-admin="{{.IsAdmin}}" data-view="{{.View}}" data-reader-comic-id="{{.ReaderComicID}}">
   <div class="ambient-bg" aria-hidden="true"></div>
@@ -77,6 +77,17 @@
       </div>
 
       <div id="comicGrid" class="comic-grid"></div>
+      <nav class="library-pagination list-bottom-pagination" data-list-pager="library" aria-label="书库分页">
+        <div class="pager-main">
+          <button class="btn" type="button" data-page-action="prev">上一页</button>
+          <span class="page-text" data-page-label aria-live="polite">第 1 / 1 页</span>
+          <button class="btn" type="button" data-page-action="next">下一页</button>
+        </div>
+        <div class="pager-side">
+          <label class="pager-label">跳至 <input type="number" min="1" value="1" inputmode="numeric" data-page-input aria-label="跳转页码" /> 页</label>
+          <button class="btn" type="button" data-page-action="jump">跳转</button>
+        </div>
+      </nav>
     </section>
 
     <section id="viewFavorites" class="view" hidden>
@@ -114,6 +125,17 @@
       </div>
 
       <div id="favoritesGrid" class="comic-grid"></div>
+      <nav class="library-pagination list-bottom-pagination" data-list-pager="favorites" aria-label="收藏分页">
+        <div class="pager-main">
+          <button class="btn" type="button" data-page-action="prev">上一页</button>
+          <span class="page-text" data-page-label aria-live="polite">第 1 / 1 页</span>
+          <button class="btn" type="button" data-page-action="next">下一页</button>
+        </div>
+        <div class="pager-side">
+          <label class="pager-label">跳至 <input type="number" min="1" value="1" inputmode="numeric" data-page-input aria-label="跳转页码" /> 页</label>
+          <button class="btn" type="button" data-page-action="jump">跳转</button>
+        </div>
+      </nav>
     </section>
 
     <section id="viewHistory" class="view" hidden>
@@ -123,7 +145,29 @@
           <p>继续上次阅读位置，快速回到最近打开的漫画。</p>
         </div>
       </section>
+      <nav class="library-pagination list-bottom-pagination" data-list-pager="history" aria-label="历史顶部分页">
+        <div class="pager-main">
+          <button class="btn" type="button" data-page-action="prev">上一页</button>
+          <span class="page-text" data-page-label aria-live="polite">第 1 / 1 页</span>
+          <button class="btn" type="button" data-page-action="next">下一页</button>
+        </div>
+        <div class="pager-side">
+          <label class="pager-label">跳至 <input type="number" min="1" value="1" inputmode="numeric" data-page-input aria-label="跳转页码" /> 页</label>
+          <button class="btn" type="button" data-page-action="jump">跳转</button>
+        </div>
+      </nav>
       <div id="historyGrid" class="comic-grid"></div>
+      <nav class="library-pagination list-bottom-pagination" data-list-pager="history" aria-label="历史分页">
+        <div class="pager-main">
+          <button class="btn" type="button" data-page-action="prev">上一页</button>
+          <span class="page-text" data-page-label aria-live="polite">第 1 / 1 页</span>
+          <button class="btn" type="button" data-page-action="next">下一页</button>
+        </div>
+        <div class="pager-side">
+          <label class="pager-label">跳至 <input type="number" min="1" value="1" inputmode="numeric" data-page-input aria-label="跳转页码" /> 页</label>
+          <button class="btn" type="button" data-page-action="jump">跳转</button>
+        </div>
+      </nav>
     </section>
 
     <section id="viewReader" class="view reader-view" hidden>
@@ -142,10 +186,16 @@
           <button id="closeReaderBtn" class="btn">关闭阅读</button>
         </div>
         <div class="reader-progress-area">
+          <label class="reader-slider-label" for="pageSlider">阅读进度</label>
           <span id="readerProgressText"></span>
           <input id="pageSlider" type="range" min="1" max="1" value="1" />
         </div>
       </div>
+      <div class="reader-feedback">
+        <span id="readerStatus" role="status" aria-live="polite"></span>
+        <button id="readerRetryBtn" class="btn" type="button" hidden>重新加载</button>
+      </div>
+      <div id="readerThumbnails" class="reader-thumbnails panel" hidden aria-label="页面缩略图"></div>
 
       <div class="reader-shell">
         <section id="readerStage" class="reader-stage" data-mode="paged" data-fit="width">
@@ -165,6 +215,10 @@
             <section id="readerPages" class="reader-pages"></section>
           </div>
         </section>
+      </div>
+      <div id="readerEndPanel" class="reader-end-panel panel" hidden>
+        <p>已到本册最后一页</p>
+        <a id="readerNextBook" class="btn primary" hidden>阅读下一册</a>
       </div>
     </section>
 
@@ -196,16 +250,24 @@
             <form id="settingsForm" class="stack-form">
               <label><span>默认阅读模式</span>
                 <select name="mode" id="settingsMode">
-                  <option value="paged">单页翻页</option>
+                  <option value="paged">翻页</option>
                   <option value="scroll">纵向滚动</option>
                 </select>
               </label>
               <label><span>默认显示适配</span>
                 <select name="fit" id="settingsFit">
                   <option value="width">适配宽度</option>
-                  <option value="height">适配高度</option>
+                  <option value="contain">显示整页</option>
+                  <option value="original">原始尺寸</option>
                 </select>
               </label>
+              <label><span>画质</span>
+                <select id="settingsQuality"><option value="economy">省流</option><option value="standard">标准</option><option value="original">原图</option></select>
+              </label>
+              <label><span>页面布局</span>
+                <select id="settingsSpread"><option value="auto">自动双页</option><option value="single">单页</option><option value="double">双页</option></select>
+              </label>
+              <label class="check-line"><input id="settingsCoverOffset" type="checkbox" /><span>封面单独显示</span></label>
               <label><span>图像优化策略（后端渲染，ZIP/PDF 分层处理）</span>
                 <select name="enhance" id="settingsEnhance">
                   <option value="off">关闭</option>
@@ -446,6 +508,7 @@
   </main>
 
   <script src="static/vendor/pdfjs/pdf.min.js?v=20260801r7" defer></script>
-  <script src="static/app.js?v=20260802r8" type="module"></script>
+  <script src="static/reader-core.js?v=20261020r10" defer></script>
+  <script src="static/app.js?v=20261020r10" type="module"></script>
 </body>
 </html>

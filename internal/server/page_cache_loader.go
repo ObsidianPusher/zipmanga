@@ -170,11 +170,6 @@ func (q *comicPageLoadQueue) runTasks(tasks []*comicPageLoadTask) {
 		return
 	}
 
-	type taskResult struct {
-		pageIdx int
-		result  comicPageLoadResult
-	}
-
 	workerCount := q.server.currentPageLoadParallelism()
 	if workerCount > len(tasks) {
 		workerCount = len(tasks)
@@ -184,7 +179,6 @@ func (q *comicPageLoadQueue) runTasks(tasks []*comicPageLoadTask) {
 	}
 
 	jobs := make(chan *comicPageLoadTask, len(tasks))
-	results := make(chan taskResult, len(tasks))
 	var wg sync.WaitGroup
 
 	for i := 0; i < workerCount; i++ {
@@ -196,10 +190,9 @@ func (q *comicPageLoadQueue) runTasks(tasks []*comicPageLoadTask) {
 					continue
 				}
 				path, err := q.server.loadRawComicPageCacheDirect(task.comic, task.provider, task.format, task.pageIdx)
-				results <- taskResult{
-					pageIdx: task.pageIdx,
-					result:  comicPageLoadResult{path: path, err: err},
-				}
+				// Return visible pages immediately; an unrelated slow prefetch
+				// in the same batch must not hold their waiters.
+				q.finishTask(task.pageIdx, comicPageLoadResult{path: path, err: err})
 			}
 		}()
 	}
@@ -210,11 +203,6 @@ func (q *comicPageLoadQueue) runTasks(tasks []*comicPageLoadTask) {
 	close(jobs)
 
 	wg.Wait()
-	close(results)
-
-	for item := range results {
-		q.finishTask(item.pageIdx, item.result)
-	}
 }
 
 func (q *comicPageLoadQueue) finishTask(pageIdx int, result comicPageLoadResult) {
