@@ -87,7 +87,12 @@ func EncodeImageLossyWebPWithOptions(img image.Image, options LossyWebPEncodeOpt
 		Method:  normalized.Method,
 	}
 	if err := gowebp.Encode(buf, img, encodeOptions); err != nil {
-		return nil, err
+		// VP8 has stricter dimension and partition limits than VP8L. Retry
+		// losslessly without resizing the page or retaining partial VP8 output.
+		buf.Reset()
+		if fallbackErr := gowebp.Encode(buf, img, nil); fallbackErr != nil {
+			return nil, fmt.Errorf("lossy webp: %v; lossless fallback: %w", err, fallbackErr)
+		}
 	}
 	if buf.Len() == 0 {
 		return nil, fmt.Errorf("encoded webp is empty")

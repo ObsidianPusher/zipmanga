@@ -467,7 +467,16 @@ func (s *Server) handleAPIAdminGetWebPTask(w http.ResponseWriter, r *http.Reques
 	}
 	s.maybeRefreshPersistedWebPTask(&task)
 	includeLogs := parseBoolQueryParam(r.URL.Query().Get("include_logs"))
-	resp := map[string]any{"task": webpTaskDTO(task)}
+	taskDTO := webpTaskDTO(task)
+	if task.Status == webpTaskFailed || task.Summary.Failed > 0 {
+		examples, err := s.listPersistedWebPTaskFailureExamples(taskID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		taskDTO["failure_examples"] = examples
+	}
+	resp := map[string]any{"task": taskDTO}
 	if includeLogs {
 		afterSeq, _ := strconv.ParseUint(strings.TrimSpace(r.URL.Query().Get("after_seq")), 10, 64)
 		logs, err := s.listPersistedWebPTaskLogsAfter(taskID, afterSeq)
@@ -936,6 +945,29 @@ func (s *Server) listPersistedWebPTasksByStatuses(statuses []webpTaskStatus, lim
 		return nil, err
 	}
 	return out, nil
+}
+
+func (s *Server) listPersistedWebPTaskFailureExamples(taskID string) ([]string, error) {
+	rows, err := s.store.DB().Query(`
+		SELECT substr(message, 1, 1024)
+		FROM webp_task_logs
+		WHERE task_id = ? AND level = 'error'
+		ORDER BY seq ASC
+		LIMIT 3
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	examples := make([]string, 0, 3)
+	for rows.Next() {
+		var message string
+		if err := rows.Scan(&message); err != nil {
+			return nil, err
+		}
+		examples = append(examples, message)
+	}
+	return examples, rows.Err()
 }
 
 func (s *Server) listPersistedWebPTaskLogsAfter(taskID string, afterSeq uint64) ([]webpTaskLogLine, error) {

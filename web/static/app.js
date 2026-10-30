@@ -1182,6 +1182,7 @@
     const startedAt = formatDateTime(task.started_at);
     const finishedAt = formatDateTime(task.finished_at);
     const errorText = String(task.error || '').trim();
+    const failureExamples = Array.isArray(task.failure_examples) ? task.failure_examples.slice(0, 3) : [];
     const sourcePath = String(task.source_path || '-');
     const outputDir = String(task.output_dir || '-');
     const currentArchive = String(task.current_archive || '').trim();
@@ -1196,6 +1197,7 @@
         <div class="full"><dt>源目录</dt><dd>${escapeHtml(sourcePath)}</dd></div>
         <div class="full"><dt>输出目录</dt><dd>${escapeHtml(outputDir)}</dd></div>
         ${errorText ? `<div class="full"><dt>错误</dt><dd class="error-text">${escapeHtml(errorText)}</dd></div>` : ''}
+        ${failureExamples.length ? `<div class="full"><dt>失败样例（最多 3 条）</dt><dd class="error-text">${failureExamples.map(message => escapeHtml(String(message))).join('<br>')}</dd></div>` : ''}
       </dl>
     `;
   }

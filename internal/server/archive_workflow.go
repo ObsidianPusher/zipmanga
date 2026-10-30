@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/bodgit/sevenzip"
 	"github.com/nwaples/rardecode"
@@ -787,7 +788,7 @@ func sanitizeDirectoryName(name string) string {
 	v = strings.ReplaceAll(v, ".", "_")
 	v = strings.Trim(v, "_ ")
 	if len(v) > 120 {
-		v = strings.TrimSpace(v[:120])
+		v = strings.TrimSpace(truncateUTF8(v, 120))
 	}
 	if v == "" {
 		return "item"
@@ -807,12 +808,22 @@ func sanitizeFileName(name string) string {
 	v = strings.ReplaceAll(v, "\r", "_")
 	v = strings.ReplaceAll(v, "\t", "_")
 	if len(v) > 180 {
-		v = strings.TrimSpace(v[:180])
+		v = strings.TrimSpace(truncateUTF8(v, 180))
 	}
 	if v == "" {
 		return "item"
 	}
 	return v
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	for maxBytes > 0 && !utf8.RuneStart(value[maxBytes]) {
+		maxBytes--
+	}
+	return value[:maxBytes]
 }
 
 func cleanArchiveEntryPath(name string) (string, bool) {

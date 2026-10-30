@@ -52,3 +52,21 @@ func minInt(a, b int) int {
 	}
 	return b
 }
+
+func TestEncodeLossyWebPFallsBackToLosslessAtVP8DimensionLimit(t *testing.T) {
+	for _, size := range []image.Point{{X: 1, Y: 16384}, {X: 16384, Y: 1}} {
+		src := image.NewNRGBA(image.Rectangle{Max: size})
+		src.SetNRGBA(0, 0, color.NRGBA{R: 220, G: 30, B: 80, A: 255})
+		got, err := EncodeImageLossyWebP(src)
+		if err != nil {
+			t.Fatalf("encode %v: %v", size, err)
+		}
+		decoded, _, err := image.Decode(bytes.NewReader(got))
+		if err != nil {
+			t.Fatalf("decode %v: %v", size, err)
+		}
+		if decoded.Bounds().Size() != size || color.NRGBAModel.Convert(decoded.At(0, 0)) != src.NRGBAAt(0, 0) {
+			t.Fatalf("lossless fallback changed bounds or pixels: %v", decoded.Bounds())
+		}
+	}
+}

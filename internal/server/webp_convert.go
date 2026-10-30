@@ -31,10 +31,11 @@ type webpConvertArchiveJob struct {
 }
 
 type webpArchiveEntry struct {
-	Index     int
-	SourceRel string
-	TargetRel string
-	IsWebP    bool
+	Index        int
+	SourceRel    string
+	TargetRel    string
+	IsWebP       bool
+	KeepOriginal bool
 }
 
 type webpArchiveWriteResult struct {
@@ -147,6 +148,7 @@ func (s *Server) executeWebPTask(task *webpTask) (webpTaskStatus, string) {
 		s.logger.Printf("persist ready state for webp task %s failed: %v", task.ID, err)
 	}
 
+	firstFailure := scanErr
 	for idx, job := range pendingJobs {
 		if s.isWebPTaskCancelRequested(task.ID) {
 			task.CancelRequested = true
@@ -171,6 +173,10 @@ func (s *Server) executeWebPTask(task *webpTask) (webpTaskStatus, string) {
 				return webpTaskCanceled, "task canceled by user"
 			}
 			stats.Failed++
+			if firstFailure == nil {
+				firstFailure = fmt.Errorf("%s: %w", job.RelPath, convErr)
+			}
+			task.Error = firstFailure.Error()
 			task.Summary = stats
 			task.UpdatedAt = timeNow()
 			_ = s.persistWebPTask(task)
@@ -198,7 +204,7 @@ func (s *Server) executeWebPTask(task *webpTask) (webpTaskStatus, string) {
 	task.ProgressDone = doneCount
 	task.Summary = stats
 	if scanErr != nil || stats.Failed > 0 {
-		return webpTaskFailed, fmt.Sprintf("webp task finished with %d failures", stats.Failed)
+		return webpTaskFailed, fmt.Sprintf("webp task finished with %d failures; first failure: %v", stats.Failed, firstFailure)
 	}
 	return webpTaskSucceeded, ""
 }
@@ -271,12 +277,9 @@ func scanWebPArchiveJobs(sourcePath, outputDir string, shouldCancel func() bool,
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		finalZip := filepath.Join(outputDir, strings.TrimSuffix(rel, filepath.Ext(rel))+".zip")
 		jobs = append(jobs, webpConvertArchiveJob{
 			SourcePath: curr,
 			RelPath:    rel,
-			FinalZip:   finalZip,
-			WorkDir:    finalZip + ".work",
 		})
 		stats.Matched++
 		if progress != nil && (stats.Matched == 1 || stats.Matched%25 == 0) {
@@ -285,8 +288,13 @@ func scanWebPArchiveJobs(sourcePath, outputDir string, shouldCancel func() bool,
 		return nil
 	})
 	sort.Slice(jobs, func(i, j int) bool {
-		return strings.ToLower(jobs[i].RelPath) < strings.ToLower(jobs[j].RelPath)
+		left, right := strings.ToLower(jobs[i].RelPath), strings.ToLower(jobs[j].RelPath)
+		if left == right {
+			return jobs[i].RelPath < jobs[j].RelPath
+		}
+		return left < right
 	})
+	assignWebPArchiveOutputPaths(jobs, outputDir)
 	return jobs, stats, err
 }
 
@@ -439,7 +447,7 @@ func applyArchiveWriteStats(stats *archiveWorkflowStats, entry webpArchiveEntry)
 	if stats == nil {
 		return
 	}
-	if entry.IsWebP {
+	if entry.IsWebP || entry.KeepOriginal {
 		stats.Kept++
 		return
 	}
@@ -459,8 +467,13 @@ func writeZipArchiveToWebPOutput(srcArchive, finalZip string, entries []webpArch
 	}
 	defer func() { _ = srcFile.Close() }()
 
-	imageFiles := ziputil.ImageFiles(reader)
-	if len(imageFiles) < len(entries) {
+	var imageFiles []*zip.File
+	for _, file := range reader.File {
+		if !file.FileInfo().IsDir() && isWebPSourceImage(file.Name) {
+			imageFiles = append(imageFiles, file)
+		}
+	}
+	if len(imageFiles) != len(entries) {
 		return fmt.Errorf("zip image count changed during processing")
 	}
 
@@ -494,16 +507,19 @@ func writeZipArchiveToWebPOutput(srcArchive, finalZip string, entries []webpArch
 				}
 				rc, err := imageFiles[entry.Index].Open()
 				if err != nil {
-					results <- webpArchiveWriteResult{Entry: entry, Err: err}
+					results <- webpArchiveWriteResult{Entry: entry, Err: fmt.Errorf("open image %q: %w", entry.SourceRel, err)}
 					continue
 				}
 				var data []byte
-				if entry.IsWebP {
+				if entry.IsWebP || entry.KeepOriginal {
 					data, err = io.ReadAll(rc)
 				} else {
 					data, err = imgcodec.EncodeLossyWebPReaderWithOptions(rc, options)
 				}
 				_ = rc.Close()
+				if err != nil {
+					err = fmt.Errorf("convert image %q: %w", entry.SourceRel, err)
+				}
 				results <- webpArchiveWriteResult{Entry: entry, Data: data, Err: err}
 			}
 		}()
@@ -605,7 +621,7 @@ func writeRARArchiveToWebPOutput(srcArchive, finalZip string, entries []webpArch
 		if err != nil {
 			return err
 		}
-		if h == nil || h.IsDir || !ziputil.IsImageName(h.Name) {
+		if h == nil || h.IsDir || !isWebPSourceImage(h.Name) {
 			continue
 		}
 		if imageIdx < 0 || imageIdx >= len(entries) {
@@ -613,16 +629,16 @@ func writeRARArchiveToWebPOutput(srcArchive, finalZip string, entries []webpArch
 		}
 		entry := entries[imageIdx]
 		var data []byte
-		if entry.IsWebP {
+		if entry.IsWebP || entry.KeepOriginal {
 			data, err = io.ReadAll(reader)
 		} else {
 			data, err = imgcodec.EncodeLossyWebPReaderWithOptions(reader, options)
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("convert image %q: %w", entry.SourceRel, err)
 		}
 		if err := writeZipEntry(writer, &zip.FileHeader{Name: entry.TargetRel, Method: zip.Deflate}, data); err != nil {
-			return err
+			return fmt.Errorf("write image %q: %w", entry.TargetRel, err)
 		}
 		applyArchiveWriteStats(stats, entry)
 		if progressCB != nil {
@@ -650,9 +666,14 @@ func openTempZipWriter(finalZip string) (string, *os.File, *zip.Writer, func(boo
 	if err := os.MkdirAll(filepath.Dir(finalZip), 0o755); err != nil {
 		return "", nil, nil, nil, err
 	}
-	tmpZip := finalZip + ".tmp"
-	out, err := os.OpenFile(tmpZip, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	out, err := os.CreateTemp(filepath.Dir(finalZip), ".webp-*.tmp")
 	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	tmpZip := out.Name()
+	if err := out.Chmod(0o644); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpZip)
 		return "", nil, nil, nil, err
 	}
 	writer := zip.NewWriter(out)
@@ -702,7 +723,7 @@ func isWebPArchiveOutputCompleteWithEntries(finalZip string, entries []webpArchi
 		if cleanName != entry.TargetRel {
 			return false, nil
 		}
-		if !strings.EqualFold(filepath.Ext(cleanName), ".webp") {
+		if !entry.KeepOriginal && !strings.EqualFold(filepath.Ext(cleanName), ".webp") {
 			return false, nil
 		}
 	}
@@ -713,15 +734,23 @@ func scanWebPArchiveEntries(srcArchive string, shouldCancel func() bool) ([]webp
 	usedNames := make(map[string]int, 128)
 	entries := make([]webpArchiveEntry, 0, 128)
 	appendEntry := func(rawName string) {
-		cleanName, ok := cleanArchiveEntryPath(rawName)
-		if !ok || !ziputil.IsImageName(cleanName) {
+		cleanName, ok := cleanArchiveEntryPath(safeWebPArchiveName(rawName))
+		if !ok || !isWebPSourceImage(cleanName) {
 			return
 		}
+		keepOriginal := strings.EqualFold(filepath.Ext(cleanName), ".avif")
+		var target string
+		if keepOriginal {
+			target = uniqueArchiveEntryName(cleanName, usedNames)
+		} else {
+			target = uniqueWebPEntryName(cleanName, usedNames)
+		}
 		entries = append(entries, webpArchiveEntry{
-			Index:     len(entries),
-			SourceRel: cleanName,
-			TargetRel: uniqueWebPEntryName(cleanName, usedNames),
-			IsWebP:    strings.EqualFold(filepath.Ext(cleanName), ".webp"),
+			Index:        len(entries),
+			SourceRel:    cleanName,
+			TargetRel:    target,
+			IsWebP:       strings.EqualFold(filepath.Ext(cleanName), ".webp"),
+			KeepOriginal: keepOriginal,
 		})
 	}
 
@@ -779,6 +808,21 @@ func scanWebPArchiveEntries(srcArchive string, shouldCancel func() bool) ([]webp
 	return entries, nil
 }
 
+// AppleDouble resource forks use image extensions but contain no image data.
+// Apply the same filter when scanning and reading to keep page indexes aligned.
+func isWebPSourceImage(name string) bool {
+	cleanName, ok := cleanArchiveEntryPath(name)
+	if !ok || !ziputil.IsImageName(cleanName) {
+		return false
+	}
+	for _, part := range strings.Split(cleanName, "/") {
+		if part == "__MACOSX" || strings.HasPrefix(part, "._") {
+			return false
+		}
+	}
+	return true
+}
+
 func countWebPEntries(entries []webpArchiveEntry) int {
 	count := 0
 	for _, entry := range entries {
@@ -804,6 +848,9 @@ func openZipReader(path string) (*zip.Reader, *os.File, error) {
 		_ = f.Close()
 		return nil, nil, err
 	}
+	for _, file := range reader.File {
+		file.Name = webPZIPEntryName(file)
+	}
 	return reader, f, nil
 }
 
@@ -821,14 +868,23 @@ func uniqueArchiveEntryName(name string, used map[string]int) string {
 	if current == "" {
 		current = "item"
 	}
-	count := used[current]
-	used[current] = count + 1
-	if count == 0 {
+	key := webPNameKey(current)
+	if used[key] == 0 {
+		used[key] = 1
 		return current
 	}
 	ext := filepath.Ext(current)
 	base := strings.TrimSuffix(current, ext)
-	return fmt.Sprintf("%s__%d%s", base, count, ext)
+	for count := used[key]; ; count++ {
+		candidate := fmt.Sprintf("%s__%d%s", base, count, ext)
+		candidateKey := webPNameKey(candidate)
+		if used[candidateKey] != 0 {
+			continue
+		}
+		used[key] = count + 1
+		used[candidateKey] = 1
+		return candidate
+	}
 }
 
 func writeZipEntry(writer *zip.Writer, header *zip.FileHeader, data []byte) error {
