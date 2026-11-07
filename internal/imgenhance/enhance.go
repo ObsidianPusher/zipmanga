@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"zipmanga/internal/imgcodec"
+
 	xdraw "golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
@@ -132,14 +134,12 @@ func Enhance(src []byte, fileName string, opt Options) ([]byte, string, error) {
 		return src, guessContentType(fileName), nil
 	}
 
-	img, _, err := image.Decode(bytes.NewReader(src))
+	config, _, err := image.DecodeConfig(bytes.NewReader(src))
 	if err != nil {
 		return nil, "", err
 	}
-	in := toNRGBA(img)
-	b := in.Bounds()
-	srcW := max(1, b.Dx())
-	srcH := max(1, b.Dy())
+	srcW := max(1, config.Width)
+	srcH := max(1, config.Height)
 	pf := modeProfile(mode, source)
 	targetW, targetH := resolveTargetSize(srcW, srcH, opt.TargetWidth, source, pf)
 
@@ -147,6 +147,11 @@ func Enhance(src []byte, fileName string, opt Options) ([]byte, string, error) {
 		return src, guessContentType(fileName), nil
 	}
 
+	img, _, err := image.Decode(bytes.NewReader(src))
+	if err != nil {
+		return nil, "", err
+	}
+	in := toNRGBA(img)
 	work := resizeForMode(in, targetW, targetH, mode)
 	if source == SourcePDF {
 		work = postProcessPDF(work, mode)
@@ -201,19 +206,22 @@ func RenderForDisplay(src []byte, fileName string, opt Options) ([]byte, string,
 	mode := normalizeMode(string(opt.Mode))
 	source := normalizeSource(opt.Source)
 
-	img, _, err := image.Decode(bytes.NewReader(src))
+	config, _, err := image.DecodeConfig(bytes.NewReader(src))
 	if err != nil {
 		return nil, "", err
 	}
-	in := toNRGBA(img)
-	b := in.Bounds()
-	srcW := max(1, b.Dx())
-	srcH := max(1, b.Dy())
+	srcW := max(1, config.Width)
+	srcH := max(1, config.Height)
 	pf := modeProfile(mode, source)
 	targetW, targetH := resolveTargetSize(srcW, srcH, opt.TargetWidth, source, pf)
 	if targetW >= srcW {
 		return src, guessContentType(fileName), nil
 	}
+	img, _, err := image.Decode(bytes.NewReader(src))
+	if err != nil {
+		return nil, "", err
+	}
+	in := toNRGBA(img)
 	work := resizeForMode(in, targetW, targetH, mode)
 	return encodeByMode(fileName, work, mode)
 }
@@ -246,6 +254,10 @@ func resizeForMode(src *image.NRGBA, dstW, dstH int, mode Mode) *image.NRGBA {
 }
 
 func encodeByMode(fileName string, img image.Image, mode Mode) ([]byte, string, error) {
+	if strings.EqualFold(filepath.Ext(strings.TrimSpace(fileName)), imgcodec.LossyWebPExt) {
+		data, err := imgcodec.EncodeImageLossyWebP(img)
+		return data, "image/webp", err
+	}
 	buf := bytes.NewBuffer(make([]byte, 0, 256*1024))
 	if strings.EqualFold(filepath.Ext(strings.TrimSpace(fileName)), ".png") {
 		if err := png.Encode(buf, img); err != nil {

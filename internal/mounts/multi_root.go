@@ -143,10 +143,11 @@ func newSingleRootProvider(mt db.Mount) (Provider, error) {
 	switch mt.Type {
 	case db.MountTypeLocal:
 		return NewLocalProvider(mt)
-	case db.MountTypeSMB:
-		return NewSMBProvider(mt)
-	case db.MountTypeWebDAV:
-		return NewWebDAVProvider(mt)
+	// SMB/WebDAV are temporarily disabled; retain these branches for restoration.
+	// case db.MountTypeSMB:
+	// 	return NewSMBProvider(mt)
+	// case db.MountTypeWebDAV:
+	// 	return NewWebDAVProvider(mt)
 	default:
 		return nil, fmt.Errorf("unsupported mount type: %s", mt.Type)
 	}

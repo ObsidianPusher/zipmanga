@@ -1589,7 +1589,7 @@ func dedupedComicBaseQuery() string {
 				) AS file_rank
 			FROM comics c
 			WHERE c.file_name_key <> ''
-			  AND ((LOWER(c.path) LIKE '%.zip' OR LOWER(c.path) LIKE '%.cbz') OR LOWER(c.path) LIKE '%.pdf')
+			  AND (LOWER(c.path) LIKE '%.zip' OR LOWER(c.path) LIKE '%.cbz')
 		)
 	`
 }
@@ -2137,6 +2137,7 @@ func (s *Store) ListReadingHistory(userID int64, limit, offset int) ([]ReadingHi
 		)
 		LEFT JOIN favorite_comics fc ON fc.comic_file_name_key = rp.comic_file_name_key AND fc.user_id = ?
 		WHERE rp.user_id = ?
+		  AND (LOWER(c.path) LIKE '%.zip' OR LOWER(c.path) LIKE '%.cbz')
 		ORDER BY rp.updated_at DESC, rp.id DESC
 		LIMIT ? OFFSET ?
 	`, userID, userID, limit, offset)
@@ -2770,6 +2771,7 @@ func (s *Store) UpsertComicReaderState(userID, comicID int64, state ComicReaderS
 func (s *Store) CountReadingHistory(userID int64) (int, error) {
 	var total int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM reading_progress rp WHERE rp.user_id=?
- AND EXISTS(SELECT 1 FROM comics c WHERE c.file_name_key=rp.comic_file_name_key)`, userID).Scan(&total)
+ AND EXISTS(SELECT 1 FROM comics c WHERE c.file_name_key=rp.comic_file_name_key
+ AND (LOWER(c.path) LIKE '%.zip' OR LOWER(c.path) LIKE '%.cbz'))`, userID).Scan(&total)
 	return total, err
 }

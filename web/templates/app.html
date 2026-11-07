@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{.Title}}</title>
   <base href="{{.BaseHref}}" />
-  <link rel="stylesheet" href="static/styles.css?v=20261020r10" />
+  <link rel="stylesheet" href="static/styles.css?v=20261107r11" />
 </head>
 <body class="app-page" data-username="{{.Username}}" data-is-admin="{{.IsAdmin}}" data-view="{{.View}}" data-reader-comic-id="{{.ReaderComicID}}">
   <div class="ambient-bg" aria-hidden="true"></div>
@@ -268,7 +268,7 @@
                 <select id="settingsSpread"><option value="auto">自动双页</option><option value="single">单页</option><option value="double">双页</option></select>
               </label>
               <label class="check-line"><input id="settingsCoverOffset" type="checkbox" /><span>封面单独显示</span></label>
-              <label><span>图像优化策略（后端渲染，ZIP/PDF 分层处理）</span>
+              <label><span>图像优化策略（后端渲染，ZIP/CBZ）</span>
                 <select name="enhance" id="settingsEnhance">
                   <option value="off">关闭</option>
                   <option value="level1">1 级优化（推荐）</option>
@@ -453,7 +453,7 @@
             <h2>挂载管理</h2>
             <form id="mountForm" class="stack-form compact">
               <label><span>名称</span><input name="name" required /></label>
-              <label><span>类型</span><select name="type" id="mountType"><option value="local">local</option><option value="smb">smb</option><option value="webdav">webdav</option></select></label>
+              <label><span>类型</span><select name="type" id="mountType"><option value="local">local</option><!-- SMB/WebDAV temporarily disabled. <option value="smb">smb</option><option value="webdav">webdav</option> --></select></label>
               <section class="mount-roots-block">
                 <div class="mount-roots-head">
                   <span>挂载根路径（可多选）</span>
@@ -507,7 +507,6 @@
     </section>
   </main>
 
-  <script src="static/vendor/pdfjs/pdf.min.js?v=20260801r7" defer></script>
   <script src="static/reader-core.js?v=20261020r10" defer></script>
   <script src="static/app.js?v=20261020r10" type="module"></script>
 </body>

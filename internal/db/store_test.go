@@ -759,3 +759,68 @@ func openTestStore(t *testing.T) *Store {
 	})
 	return store
 }
+
+func TestLibraryExcludesPreviouslyIndexedPDF(t *testing.T) {
+	store := openTestStore(t)
+	user, err := store.CreateUser("no-pdf", "hash", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt, err := store.CreateMount(Mount{Name: "local", Type: MountTypeLocal, RootPath: "/books", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"book.zip", "old.PDF"} {
+		if err := store.UpsertComicForMount(mt.ID, Comic{Path: path, Title: path}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	books, err := store.ListComicsForUser(user.ID, "", 0, "all", "all", "all", "", "title", "asc", 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != 1 || books[0].Comic.Path != "book.zip" {
+		t.Fatalf("library contains unsupported comics: %+v", books)
+	}
+	count, err := store.CountComicsForUser(user.ID, "", 0, "all", "all", "all", "")
+	if err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestHistoryExcludesPreviouslyIndexedPDF(t *testing.T) {
+	store := openTestStore(t)
+	user, err := store.CreateUser("no-pdf-history", "hash", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt, err := store.CreateMount(Mount{Name: "local", Type: MountTypeLocal, RootPath: "/books", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"book.zip", "old.PDF"} {
+		if err := store.UpsertComicForMount(mt.ID, Comic{Path: path, Title: path}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	books, err := store.ListComicsByMount(mt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, book := range books {
+		if _, err := store.UpsertReadingProgress(user.ID, book.ID, book.FileNameKey, 1, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	history, err := store.ListReadingHistory(user.ID, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Comic.Path != "book.zip" {
+		t.Errorf("history contains unsupported comics: %+v", history)
+	}
+	count, err := store.CountReadingHistory(user.ID)
+	if err != nil || count != 1 {
+		t.Errorf("count=%d err=%v", count, err)
+	}
+}

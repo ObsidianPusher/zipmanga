@@ -36,7 +36,7 @@
   const ENHANCE_MODE_LEVEL1 = 'level1';
   const ENHANCE_MODE_LEVEL2 = 'level2';
   const DEFAULT_ENHANCE_MODE = ENHANCE_MODE_LEVEL1;
-  const READER_RENDER_REVISION = 'r8';
+  const READER_RENDER_REVISION = 'r9';
   const SCROLL_RENDER_MAX_CONCURRENT = 2;
   const ENHANCE_RENDER_PROFILES = Object.freeze({
     [ENHANCE_MODE_OFF]: {
@@ -331,11 +331,6 @@
 
   function nextReaderRenderEpoch() {
     state.renderEpoch += 1;
-    for (const [key, controller] of imageRequests) {
-      controller.abort();
-      state.imageCache.delete(key);
-    }
-    imageRequests.clear();
     return state.renderEpoch;
   }
 
@@ -394,6 +389,10 @@
   }
 
   function clearReaderImageCache() {
+    for (const controller of imageRequests.values()) {
+      controller.abort();
+    }
+    imageRequests.clear();
     state.imageCache.clear();
     cachedImageSources.clear();
     state.imageObjectURLs.forEach((url) => {
@@ -2145,9 +2144,8 @@
       const finished = state.comics.filter(c => normalizeReadingStatus(c) === 'finished').length;
       const reading = state.comics.filter(c => normalizeReadingStatus(c) === 'reading').length;
       const zipCount = state.comics.filter(c => String(c.format || '').toLowerCase() === 'zip').length;
-      const pdfCount = state.comics.filter(c => String(c.format || '').toLowerCase() === 'pdf').length;
       el.summaryText.textContent = total
-        ? `共 ${total} 本 · 当前第 ${state.library.page}/${Math.max(1, state.library.totalPages)} 页 · 本页 ZIP ${zipCount} · PDF ${pdfCount} · 本页阅读中 ${reading} · 本页已读完 ${finished}`
+        ? `共 ${total} 本 · 当前第 ${state.library.page}/${Math.max(1, state.library.totalPages)} 页 · 本页 ZIP ${zipCount} · 本页阅读中 ${reading} · 本页已读完 ${finished}`
         : '没有找到漫画';
     }
     if (el.comicGrid) renderComicCards(el.comicGrid, state.comics, { context: 'library' });

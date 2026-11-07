@@ -116,7 +116,7 @@ func (s *Server) serveReaderPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	format := comicfmt.Detect(comic.Path)
-	if !comicfmt.IsArchive(format) && format != comicfmt.FormatPDF {
+	if !comicfmt.IsArchive(format) {
 		writeJSON(w, 400, map[string]any{"error": "unsupported comic format"})
 		return
 	}
@@ -131,6 +131,20 @@ func (s *Server) serveReaderPage(w http.ResponseWriter, r *http.Request) {
 	}
 	if provider.Type() == db.MountTypeWebDAV {
 		s.warmCoverForReadingAsync(comic, provider)
+	}
+	enhance := normalizeEnhanceMode(r.URL.Query().Get("enhance"))
+	width := readerDisplayWidth(parseBoundedInt(r.URL.Query().Get("w"), 0, 0, 7000), quality)
+	key := fmt.Sprintf("page:display:v2:%s:%d:%d:%d:%d:%s:%s:%d", format, comic.ID, index, comic.MtimeUnix, comic.Size, quality, enhance, width)
+	if quality != "original" && s.pageCache != nil {
+		if displayPath, ok, err := s.pageCache.GetPathIfExists(key); err == nil && ok {
+			if r.Context().Err() != nil {
+				return
+			}
+			s.prefetchReaderPages(comic, provider, format, index, r.URL.Query().Get("direction"))
+			w.Header().Set("Server-Timing", fmt.Sprintf("read;dur=%.2f, render;dur=0, cache;desc=\"true\"", float64(time.Since(started).Microseconds())/1000))
+			s.serveCachedPageFile(w, r, displayPath, archiveutil.GuessImageContentType(displayPath))
+			return
+		}
 	}
 	var rawPath string
 	if quality == "original" {
@@ -150,14 +164,11 @@ func (s *Server) serveReaderPage(w http.ResponseWriter, r *http.Request) {
 	if quality != "original" {
 		s.prefetchReaderPages(comic, provider, format, index, direction)
 	}
-	if quality == "original" {
+	if quality == "original" || (quality == "standard" && strings.EqualFold(filepath.Ext(rawPath), ".webp")) {
 		w.Header().Set("Server-Timing", fmt.Sprintf("read;dur=%.2f", float64(readDuration.Microseconds())/1000))
 		s.serveCachedPageFile(w, r, rawPath, archiveutil.GuessImageContentType(rawPath))
 		return
 	}
-	enhance := normalizeEnhanceMode(r.URL.Query().Get("enhance"))
-	width := readerDisplayWidth(parseBoundedInt(r.URL.Query().Get("w"), 0, 0, 7000), quality)
-	key := fmt.Sprintf("page:display:v1:%s:%d:%d:%d:%d:%s:%s:%d", format, comic.ID, index, comic.MtimeUnix, comic.Size, quality, enhance, width)
 	renderStarted := time.Now()
 	cached := false
 	if _, ok, _ := s.pageCache.GetPathIfExists(key); ok {

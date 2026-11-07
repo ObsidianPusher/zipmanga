@@ -50,8 +50,8 @@ func TestIsComicName(t *testing.T) {
 		{name: "a.cbr", want: false},
 		{name: "a.7z", want: false},
 		{name: "a.cb7", want: false},
-		{name: "a.pdf", want: true},
-		{name: "a.PDF", want: true},
+		{name: "a.pdf", want: false},
+		{name: "a.PDF", want: false},
 		{name: "a.jpg", want: false},
 	}
 	for _, tc := range cases {
@@ -64,11 +64,11 @@ func TestIsComicName(t *testing.T) {
 func TestNormalizedEntryPathFallback(t *testing.T) {
 	e := mounts.FileEntry{
 		Path:  "broken/path/noext",
-		Name:  "sample.pdf",
+		Name:  "sample.cbz",
 		IsDir: false,
 	}
 	got := normalizedEntryPath("books", e)
-	if got != "books/sample.pdf" {
+	if got != "books/sample.cbz" {
 		t.Fatalf("normalizedEntryPath fallback mismatch: %q", got)
 	}
 }
@@ -94,8 +94,8 @@ func TestListComicFilesRecursive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listComicFiles err: %v", err)
 	}
-	if len(files) != 3 {
-		t.Fatalf("listComicFiles count=%d want=3", len(files))
+	if len(files) != 1 {
+		t.Fatalf("listComicFiles count=%d want=1", len(files))
 	}
 }
 
@@ -148,7 +148,7 @@ func TestListComicFilesPreserveDirTrailingSpace(t *testing.T) {
 				{Path: "2018 合集 ", Name: "2018 合集 ", IsDir: true, ModTime: now},
 			},
 			"2018 合集 ": {
-				{Path: "2018 合集 /第1话.pdf", Name: "第1话.pdf", IsDir: false, ModTime: now},
+				{Path: "2018 合集 /第1话.cbz", Name: "第1话.cbz", IsDir: false, ModTime: now},
 			},
 		},
 	}
@@ -159,7 +159,7 @@ func TestListComicFilesPreserveDirTrailingSpace(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("listComicFiles count=%d want=1", len(files))
 	}
-	if got := files[0].Path; got != "2018 合集 /第1话.pdf" {
-		t.Fatalf("listComicFiles path=%q want=%q", got, "2018 合集 /第1话.pdf")
+	if got := files[0].Path; got != "2018 合集 /第1话.cbz" {
+		t.Fatalf("listComicFiles path=%q want=%q", got, "2018 合集 /第1话.cbz")
 	}
 }

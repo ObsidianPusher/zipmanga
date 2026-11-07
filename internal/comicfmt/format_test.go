@@ -31,3 +31,16 @@ func TestIsArchive(t *testing.T) {
 		t.Fatal("non-archive formats should not be archive")
 	}
 }
+
+func TestSupportedPathsExcludePDF(t *testing.T) {
+	for _, path := range []string{"book.pdf", "book.PDF"} {
+		if IsSupportedPath(path) {
+			t.Errorf("PDF reading must be disabled: %s", path)
+		}
+	}
+	for _, path := range []string{"book.zip", "book.CBZ"} {
+		if !IsSupportedPath(path) {
+			t.Errorf("archive reading must remain enabled: %s", path)
+		}
+	}
+}

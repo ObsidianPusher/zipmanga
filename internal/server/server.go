@@ -1114,6 +1114,11 @@ func (s *Server) handleAPIComicDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !comicfmt.IsSupportedPath(c.Path) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported comic format"})
+		return
+	}
+
 	format := comicfmt.Detect(c.Path)
 	// 对归档漫画，页数为 0/1 都可能来自历史探测异常，先异步回温一次。
 	if c.PageCount <= 0 || (comicfmt.IsArchive(format) && c.PageCount <= 1) {
@@ -1662,7 +1667,7 @@ func (s *Server) handleAPIComicFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, statusFromErr(err), map[string]any{"error": err.Error()})
 		return
 	}
-	if comicfmt.Detect(comic.Path) == comicfmt.FormatUnknown {
+	if !comicfmt.IsSupportedPath(comic.Path) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "unsupported comic format"})
 		return
 	}
@@ -2033,26 +2038,27 @@ func decodeMountRequest(r *http.Request) (db.Mount, error) {
 		if m.RootPath == "" {
 			return db.Mount{}, fmt.Errorf("root_path is required for local mount")
 		}
-	case db.MountTypeSMB:
-		if m.SMBHost == "" || m.SMBShare == "" {
-			return db.Mount{}, fmt.Errorf("smb_host and smb_share are required for smb mount")
-		}
-		if m.SMBPort == 0 {
-			m.SMBPort = 445
-		} else if m.SMBPort < 1 || m.SMBPort > 65535 {
-			return db.Mount{}, fmt.Errorf("smb_port is out of range")
-		}
-	case db.MountTypeWebDAV:
-		if m.WebDAVURL == "" {
-			return db.Mount{}, fmt.Errorf("webdav_url is required for webdav mount")
-		}
-		u, err := neturl.Parse(m.WebDAVURL)
-		if err != nil || u.Host == "" {
-			return db.Mount{}, fmt.Errorf("webdav_url is invalid")
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return db.Mount{}, fmt.Errorf("webdav_url scheme must be http or https")
-		}
+	// SMB/WebDAV are temporarily disabled; retain these branches for restoration.
+	// case db.MountTypeSMB:
+	// 	if m.SMBHost == "" || m.SMBShare == "" {
+	// 		return db.Mount{}, fmt.Errorf("smb_host and smb_share are required for smb mount")
+	// 	}
+	// 	if m.SMBPort == 0 {
+	// 		m.SMBPort = 445
+	// 	} else if m.SMBPort < 1 || m.SMBPort > 65535 {
+	// 		return db.Mount{}, fmt.Errorf("smb_port is out of range")
+	// 	}
+	// case db.MountTypeWebDAV:
+	// 	if m.WebDAVURL == "" {
+	// 		return db.Mount{}, fmt.Errorf("webdav_url is required for webdav mount")
+	// 	}
+	// 	u, err := neturl.Parse(m.WebDAVURL)
+	// 	if err != nil || u.Host == "" {
+	// 		return db.Mount{}, fmt.Errorf("webdav_url is invalid")
+	// 	}
+	// 	if u.Scheme != "http" && u.Scheme != "https" {
+	// 		return db.Mount{}, fmt.Errorf("webdav_url scheme must be http or https")
+	// 	}
 	default:
 		return db.Mount{}, fmt.Errorf("unsupported mount type")
 	}
@@ -2147,26 +2153,27 @@ func decodeMountBrowseRequest(r *http.Request) (db.Mount, string, error) {
 	switch m.Type {
 	case db.MountTypeLocal:
 		// local 浏览使用请求中的 root_path 作为浏览根。
-	case db.MountTypeSMB:
-		if m.SMBHost == "" || m.SMBShare == "" {
-			return db.Mount{}, "", fmt.Errorf("smb_host and smb_share are required for smb mount")
-		}
-		if m.SMBPort == 0 {
-			m.SMBPort = 445
-		} else if m.SMBPort < 1 || m.SMBPort > 65535 {
-			return db.Mount{}, "", fmt.Errorf("smb_port is out of range")
-		}
-	case db.MountTypeWebDAV:
-		if m.WebDAVURL == "" {
-			return db.Mount{}, "", fmt.Errorf("webdav_url is required for webdav mount")
-		}
-		u, err := neturl.Parse(m.WebDAVURL)
-		if err != nil || u.Host == "" {
-			return db.Mount{}, "", fmt.Errorf("webdav_url is invalid")
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return db.Mount{}, "", fmt.Errorf("webdav_url scheme must be http or https")
-		}
+	// SMB/WebDAV are temporarily disabled; retain these branches for restoration.
+	// case db.MountTypeSMB:
+	// 	if m.SMBHost == "" || m.SMBShare == "" {
+	// 		return db.Mount{}, "", fmt.Errorf("smb_host and smb_share are required for smb mount")
+	// 	}
+	// 	if m.SMBPort == 0 {
+	// 		m.SMBPort = 445
+	// 	} else if m.SMBPort < 1 || m.SMBPort > 65535 {
+	// 		return db.Mount{}, "", fmt.Errorf("smb_port is out of range")
+	// 	}
+	// case db.MountTypeWebDAV:
+	// 	if m.WebDAVURL == "" {
+	// 		return db.Mount{}, "", fmt.Errorf("webdav_url is required for webdav mount")
+	// 	}
+	// 	u, err := neturl.Parse(m.WebDAVURL)
+	// 	if err != nil || u.Host == "" {
+	// 		return db.Mount{}, "", fmt.Errorf("webdav_url is invalid")
+	// 	}
+	// 	if u.Scheme != "http" && u.Scheme != "https" {
+	// 		return db.Mount{}, "", fmt.Errorf("webdav_url scheme must be http or https")
+	// 	}
 	default:
 		return db.Mount{}, "", fmt.Errorf("unsupported mount type")
 	}

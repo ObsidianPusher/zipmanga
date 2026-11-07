@@ -634,6 +634,7 @@ body.reader-active .page-wrap {
 
 .webp-progress-card {
   display: grid;
+  overflow-wrap: anywhere;
   gap: 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -797,6 +798,7 @@ body.reader-active .page-wrap {
 
 #webpConvertTaskList .archive-task-item {
   display: grid;
+  overflow-wrap: anywhere;
   gap: 4px;
   width: 100%;
   text-align: left;
@@ -1198,6 +1200,10 @@ body.fullscreen-reading .reader-paged-wrap,
 body.fullscreen-reading .reader-scroll-wrap {
   min-height: 100dvh;
   padding: 0;
+}
+
+body.fullscreen-reading .reader-stage[data-mode="paged"] .reader-paged-wrap {
+  min-height: 100dvh;
 }
 
 body.fullscreen-reading .reader-stage[data-mode="paged"] .reader-page-media,

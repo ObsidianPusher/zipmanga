@@ -39,7 +39,7 @@ func IsArchive(format Format) bool {
 
 func IsSupportedPath(path string) bool {
 	switch Detect(path) {
-	case FormatZIP, FormatPDF:
+	case FormatZIP:
 		return true
 	default:
 		return false
